@@ -1,0 +1,25 @@
+{
+  "name": "provn-sdk",
+  "version": "0.6.0",
+  "description": "PROVN AI Agent Governance SDK — cryptographic audit trails, compliance gates, and kill switch in 3 lines",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["ai", "agents", "governance", "compliance", "observability", "eu-ai-act", "dpdp", "llm"],
+  "author": "PROVN <sdk@provn.ai>",
+  "license": "MIT",
+  "homepage": "https://provn.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/provn-ai/provn-sdk-node"
+  },
+  "files": ["dist", "src"],
+  "engines": { "node": ">=16" },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  }
+}
