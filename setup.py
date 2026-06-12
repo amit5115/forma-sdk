@@ -9,7 +9,7 @@ setup(
     author="FORMA",
     author_email="sdk@forma.ai",
     url="https://github.com/amit5115/forma-sdk",
-    packages=find_packages(),
+    packages=find_packages(include=["trustlayer*", "provn*"]),
     python_requires=">=3.8",
     install_requires=[
         "httpx>=0.24.0",
