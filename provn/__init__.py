@@ -74,7 +74,7 @@ def init(
 
     Args:
         api_key:       Your PROVN API key (or set TRUSTLAYER_API_KEY env var).
-        api_url:       PROVN backend URL (default: http://localhost:8001).
+        api_url:       PROVN backend URL (default: https://forma.2bd.net).
         agent_name:    Display name for auto-captured ambient runs. Defaults to
                        the basename of sys.argv[0].
         human_sponsor: Accountable human for compliance (e.g. "alice@company.com").

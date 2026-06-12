@@ -243,8 +243,8 @@ def _api_get(path: str, api_url: str, api_key: str) -> dict:
 
 def _get_api_config():
     return (
-        os.environ.get("TRUSTLAYER_API_URL", "http://localhost:8001"),
-        os.environ.get("TRUSTLAYER_API_KEY", "dev"),
+        os.environ.get("FORMA_API_URL") or os.environ.get("TRUSTLAYER_API_URL") or "https://forma.2bd.net",
+        os.environ.get("FORMA_API_KEY") or os.environ.get("TRUSTLAYER_API_KEY", "dev"),
     )
 
 

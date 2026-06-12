@@ -54,7 +54,7 @@ _ambient_config: dict = {
     "gate_enabled": False,      # pre-call compliance gate check
     "kill_event": None,         # threading.Event set by global kill poller
     "api_key": "dev",
-    "api_url": "http://localhost:8001",
+    "api_url": "https://forma.2bd.net",
 }
 
 _ambient_runs: list = []                                   # all pending ambient runs
@@ -121,8 +121,8 @@ def _flush_shadow_events():
             if not events:
                 continue
             try:
-                api_url = os.environ.get("TRUSTLAYER_API_URL", "http://localhost:8001").rstrip("/")
-                api_key = os.environ.get("TRUSTLAYER_API_KEY", "dev")
+                api_url = (os.environ.get("FORMA_API_URL") or os.environ.get("TRUSTLAYER_API_URL") or "https://forma.2bd.net").rstrip("/")
+                api_key = os.environ.get("FORMA_API_KEY") or os.environ.get("TRUSTLAYER_API_KEY", "dev")
                 payload = json.dumps({"events": events}).encode()
                 req = urllib.request.Request(
                     url=f"{api_url}/api/shadow/events", data=payload,

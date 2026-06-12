@@ -220,7 +220,12 @@ class PROVNTracker:
         auto_capture: bool = True,
     ):
         self.api_key = api_key or os.environ.get("TRUSTLAYER_API_KEY", "dev")
-        self.api_url = api_url or os.environ.get("TRUSTLAYER_API_URL", "http://localhost:8001")
+        self.api_url = (
+            api_url
+            or os.environ.get("FORMA_API_URL")
+            or os.environ.get("TRUSTLAYER_API_URL")
+            or "https://forma.2bd.net"
+        )
         self.agent_name = agent_name
         self.agent_version = agent_version
         self.human_sponsor = human_sponsor or os.environ.get("TRUSTLAYER_HUMAN_SPONSOR") or None
