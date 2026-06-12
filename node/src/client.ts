@@ -124,7 +124,7 @@ export class ProvnClient {
   constructor(config: ProvnConfig) {
     this.apiKey = config.apiKey;
     this.humanSponsor = config.humanSponsor ?? "";
-    this.baseUrl = (config.baseUrl ?? "https://api.provn.ai").replace(/\/$/, "");
+    this.baseUrl = (config.baseUrl ?? process.env.FORMA_API_URL ?? "https://forma.2bd.net").replace(/\/$/, "");
     this.timeout = config.timeout ?? 10_000;
   }
 
