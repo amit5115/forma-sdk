@@ -233,14 +233,57 @@ class PROVNTracker:
             except Exception:
                 pass
 
+    def _local_or_server_gate(
+        self,
+        agent_ref: str,
+        *,
+        action_type: str,
+        prompt: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        tool_args: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Gate an action: local cached policy when available (<1ms, decisions
+        batch-reported to the audit trail), otherwise the server gate check.
+        """
+        try:
+            from .gate_local import get_shared_cache
+            cache = get_shared_cache()
+            if cache:
+                result = cache.check(
+                    agent_ref, action_type=action_type,
+                    prompt=prompt, tool_name=tool_name, tool_args=tool_args,
+                )
+                if result is not None:
+                    return result
+        except Exception:
+            pass
+        return self._client.gate_check(
+            agent_id=agent_ref, action_type=action_type,
+            prompt=prompt, tool_name=tool_name, tool_args=tool_args,
+        )
+
     def require_approval(
         self,
-        via: str = "webhook",
+        via: str = "forma",
         url: Optional[str] = None,
         timeout: int = 3600,
         poll_interval: int = 5,
         message: Optional[str] = None,
+        when: Optional[Callable] = None,
+        title: Optional[str] = None,
     ):
+        """
+        Human-in-the-loop: pause the agent until a human decides in the
+        FORMA Approvals inbox.
+
+            @tracker.track
+            @tracker.require_approval(
+                when=lambda result: result["amount"] > 1_000_000,
+                message="Loan above ₹10L requires human review (RBI).",
+            )
+            def approve_loan(application): ...
+        """
         from .approval import RequireApprovalDecorator
         return RequireApprovalDecorator(
             tracker=self,
@@ -249,6 +292,8 @@ class PROVNTracker:
             timeout=timeout,
             poll_interval=poll_interval,
             message=message,
+            when=when,
+            title=title,
         )
 
     def agent(
@@ -273,20 +318,34 @@ class PROVNTracker:
         compliance: Optional[List[str]] = None,
         # Cost governance
         max_cost_usd: Optional[float] = None,
+        # Runtime enforcement — framework policy packs evaluated locally
+        # before every LLM/tool call (<1ms, no network hop in the hot path)
+        enforce: Optional[List[str]] = None,
     ):
         """
-        Full-featured decorator with identity passport, kill switch, and chain support.
+        Full-featured decorator with identity passport, kill switch, chain
+        support, and runtime compliance enforcement.
 
             @tracker.agent(
-                name="cv-screening",
-                purpose="HR candidate screening",
-                authorized_actions=["read_cv", "send_email"],
+                name="loan-approval",
+                purpose="Loan application evaluation",
                 risk_level="HIGH",
                 kill_switch=True,
+                enforce=["rbi_ml_risk", "dpdp"],   # blocks violations pre-execution
             )
-            def screen_candidate(cv: str) -> dict: ...
+            def approve_loan(application: dict) -> dict: ...
         """
         def decorator(fn: Callable) -> Callable:
+            # ── Runtime enforcement: register policy + start local gate ──────
+            if enforce:
+                try:
+                    from .gate_local import get_shared_cache
+                    cache = get_shared_cache(self._client)
+                    if cache:
+                        cache.register(name or self.agent_name or fn.__name__, enforce)
+                except Exception:
+                    pass
+
             @functools.wraps(fn)
             def wrapper(*args, **kwargs):
                 agent_name    = name or self.agent_name or fn.__name__
@@ -319,6 +378,7 @@ class PROVNTracker:
                         "input_hash": input_hash,
                         "risk_level": risk_level,
                         "purpose": purpose,
+                        "enforce": list(enforce) if enforce else [],
                     },
                 )
                 _set_current_run(run)
@@ -562,13 +622,11 @@ class PROVNTracker:
         """
         run = _current_run()
 
-        # ── Pre-emptive compliance gate ────────────────────────────────────
+        # ── Pre-emptive compliance gate (local policy first, server fallback) ──
         if gate and run is not None:
             agent_id = getattr(run, "_agent_id", None) or run.agent_name
-            gate_result = self._client.gate_check(
-                agent_id=agent_id,
-                action_type="llm_call",
-                prompt=prompt,
+            gate_result = self._local_or_server_gate(
+                agent_id, action_type="llm_call", prompt=prompt,
             )
             if gate_result.get("decision") == "block":
                 raise ComplianceViolation(
@@ -617,14 +675,12 @@ class PROVNTracker:
         """
         run = _current_run()
 
-        # ── Pre-emptive compliance gate ────────────────────────────────────
+        # ── Pre-emptive compliance gate (local policy first, server fallback) ──
         if gate and run is not None:
             agent_id = getattr(run, "_agent_id", None) or run.agent_name
-            gate_result = self._client.gate_check(
-                agent_id=agent_id,
-                action_type="tool_call",
-                tool_name=tool_name,
-                tool_args=tool_args,
+            gate_result = self._local_or_server_gate(
+                agent_id, action_type="tool_call",
+                tool_name=tool_name, tool_args=tool_args,
             )
             if gate_result.get("decision") == "block":
                 raise ComplianceViolation(
@@ -705,19 +761,24 @@ def agent(
     drift_threshold: float = 0.15,
     compliance: Optional[List[str]] = None,
     max_cost_usd: Optional[float] = None,
+    enforce: Optional[List[str]] = None,
 ):
     """
-    Module-level @agent decorator — full governance stack.
+    Module-level @agent decorator — full governance stack with runtime
+    enforcement.
 
         @tl.agent(
-            name="cv-screening",
-            purpose="HR candidate screening",
-            authorized_actions=["read_cv", "send_email"],
+            name="loan-approval",
+            purpose="Loan application evaluation",
             risk_level="HIGH",
             kill_switch=True,
-            compliance=["EU_AI_ACT", "DPDP"],
+            enforce=["rbi_ml_risk", "dpdp"],   # block violations pre-execution
         )
-        def screen_candidate(cv: str) -> dict: ...
+        def approve_loan(application: dict) -> dict: ...
+
+    With enforce=[...], every LLM/tool call is checked against the framework
+    policy packs locally (<1ms) BEFORE it executes. Violations raise
+    ComplianceViolation and appear as blocked events in the audit trail.
     """
     return _get_default_tracker().agent(
         func,
@@ -726,5 +787,5 @@ def agent(
         risk_level=risk_level, kill_switch=kill_switch,
         chain_parent=chain_parent, chain_id=chain_id,
         drift_threshold=drift_threshold, compliance=compliance,
-        max_cost_usd=max_cost_usd,
+        max_cost_usd=max_cost_usd, enforce=enforce,
     )

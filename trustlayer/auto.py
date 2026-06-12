@@ -223,14 +223,43 @@ def _extract_prompt(kwargs: dict) -> "str | None":
 def _maybe_gate_check(model: str, prompt: "str | None" = None) -> None:
     """
     Pre-call compliance gate check. Raises ComplianceViolation on "block".
+
+    Order:
+      1. Local cached policy for the active agent (set via enforce=[...] or
+         init(enforce=[...])) — <1ms, no network hop.
+      2. Server-side gate check, only when gate_enabled and no local policy.
     On any infrastructure error the call is allowed through (fail-open).
     """
+    from trustlayer.tracker import ComplianceViolation
+
+    # Resolve which agent this call belongs to: decorated run > ambient agent
+    run = _get_current_run()
+    agent_name = (run.agent_name if run is not None else None) or _ambient_config["agent_name"]
+
+    # 1. Local enforcement (policy cached by enforce=[...])
+    try:
+        from trustlayer.gate_local import get_shared_cache
+        cache = get_shared_cache()
+        if cache:
+            result = cache.check(agent_name, action_type="llm_call", prompt=prompt)
+            if result is not None:
+                if result.get("decision") == "block":
+                    raise ComplianceViolation(
+                        reason=result.get("reason", "Compliance gate blocked this LLM call."),
+                        rule_id=result.get("rule_id"),
+                    )
+                return
+    except ComplianceViolation:
+        raise
+    except Exception:
+        pass
+
+    # 2. Server fallback
     if not _ambient_config.get("gate_enabled"):
         return
-    from trustlayer.tracker import ComplianceViolation
     try:
         result = _get_ambient_client().gate_check(
-            agent_id=_ambient_config["agent_name"],
+            agent_id=agent_name,
             action_type="llm_call",
             prompt=prompt,
         )

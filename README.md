@@ -1,10 +1,9 @@
 # FORMA SDK
 
-**AI agent compliance, in 2 lines of code.**
+**Make non-compliance impossible — in one line of code.**
 
-FORMA automatically generates signed compliance certificates and cryptographic audit trails for every AI agent run — covering RBI, DPDP, EU AI Act, and ISO 42001. No consultants. No manual reporting.
+FORMA doesn't just record what your AI did; it **blocks non-compliant decisions before they execute**. Add `enforce=[...]` and PII leaks, prompt injections, and policy violations are stopped at runtime — then every decision is cryptographically signed and mapped to RBI, DPDP, EU AI Act, and ISO 42001.
 
-[![PyPI version](https://badge.fury.io/py/forma-sdk.svg)](https://pypi.org/project/forma-sdk/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
@@ -16,163 +15,158 @@ FORMA automatically generates signed compliance certificates and cryptographic a
 pip install forma-sdk
 ```
 
-## Quickstart
+Import name is `trustlayer` (the legacy alias `provn` also works):
+
+```python
+import trustlayer as tl
+```
+
+## Quickstart — runtime enforcement
 
 ```python
 import trustlayer as tl
 
-# Initialize once at app startup
-tl.init(
-    api_key="tl_live_YOUR_KEY_HERE",   # from forma.2bd.net → Settings
-    human_sponsor="your@email.com",
-)
+tl.init(api_key="tl_live_YOUR_KEY")   # from forma.2bd.net → Settings
 
-# Decorate any agent function — zero other changes needed
+@tl.agent(
+    purpose="Loan application evaluation",
+    risk_level="HIGH",
+    enforce=["rbi_ml_risk", "dpdp"],   # ← blocks violations BEFORE they run
+)
+def approve_loan(application: dict) -> dict:
+    return run_underwriting_model(application)
+```
+
+Now, before any LLM or tool call executes:
+
+- An Aadhaar / PAN / card number in the prompt → **blocked** (DPDP)
+- "Ignore previous instructions…" / jailbreaks → **blocked**
+- "Auto-approve without review" → **blocked** (RBI human-review rule)
+
+A blocked action raises `ComplianceViolation`, and every decision (allow / warn / block) lands in your signed audit trail. The gate runs **locally in ~1 ms** — no network hop in your request path.
+
+```python
+from trustlayer import ComplianceViolation
+
+try:
+    result = approve_loan(application)
+except ComplianceViolation as e:
+    print(e.reason)   # "PII detected in LLM prompt: Aadhaar number. ..."
+```
+
+## Zero-config tracking (no enforcement)
+
+```python
+import trustlayer as tl
+tl.init(api_key="tl_live_YOUR_KEY")
+
+# Every OpenAI / Anthropic / LangChain / LiteLLM call is now auto-captured —
+# tokens, cost, latency, anomaly score — with no other code changes.
+```
+
+## Human approvals (EU AI Act Article 14 / RBI human review)
+
+```python
 @tl.track
-def my_agent(query: str) -> str:
-    # Your LLM calls here — auto-captured
-    return "response"
-
-# Every call now generates a signed audit trail
-result = my_agent("Approve this loan application")
-```
-
-That's it. FORMA captures input, output, decision, confidence, tokens, latency, and anomaly score for every run — and generates a compliance certificate you can show regulators.
-
----
-
-## Features
-
-| Feature | What it does |
-|---------|-------------|
-| **Auto-tracking** | `@tl.track` captures every run with zero code changes |
-| **Compliance certificates** | Signed PDF/JSON certs for RBI, DPDP, EU AI Act, ISO 42001 |
-| **Kill switch** | Instantly halt any agent across all instances |
-| **Anomaly detection** | Real-time drift and outlier detection on every run |
-| **Transparency chain** | Cryptographic Merkle tree audit log |
-| **Evidence bundles** | One-click export for auditors |
-| **Gate checks** | Block actions before they execute |
-
----
-
-## Dashboard
-
-Sign up at **[forma.2bd.net](http://forma.2bd.net)** to get your API key and access the full compliance dashboard.
-
----
-
-## Advanced Usage
-
-### Manual run tracking
-
-```python
-from trustlayer import PROVNClient, AgentRun
-import uuid
-
-client = PROVNClient(api_key="tl_live_YOUR_KEY")
-
-run = AgentRun(
-    run_id=str(uuid.uuid4()),
-    agent_id="agt_YOUR_AGENT_ID",
-    agent_name="LoanApprovalAgent",
-    agent_version="2.1",
-    input_summary="Loan application for ₹5L",
-    output_summary="Approved with 94% confidence",
-    decision="approve",
-    confidence_score=0.94,
+@tl.require_approval(
+    when=lambda result: result["amount"] > 1_000_000,   # only high-stakes
+    message="Loan above ₹10L requires human review.",
 )
-client.send_run(run)
+def approve_loan(application: dict) -> dict:
+    return run_underwriting_model(application)
 ```
 
-### Gate checks (block before execute)
+The decision pauses in your FORMA Approvals inbox until a human approves or rejects. Fail-closed: a timeout or unreachable API is treated as a denial — a skipped review never silently passes.
+
+---
+
+## Policy packs
+
+| Pack | Region | Enforces |
+|------|--------|----------|
+| `dpdp` | India | Aadhaar / PAN / card / phone blocked from prompts & tool args; consent-bypass blocked |
+| `rbi_ml_risk` | India Banking | auto-approval-without-review blocked; fund-disbursal routed to approval |
+| `eu_ai_act` | EU | human-oversight bypass (Art. 14) & logging suppression (Art. 12) blocked; PII protection |
+| `iso42001` | Global | concealing AI involvement blocked |
+
+---
+
+## Manual step control
 
 ```python
-import trustlayer as tl
-
-allowed = tl.gate.check(
-    agent_id="agt_YOUR_AGENT_ID",
-    action_type="financial_decision",
-    payload={"amount": 500000, "customer_id": "C123"}
-)
-
-if not allowed:
-    raise ValueError("Action blocked by compliance gate")
-```
-
-### Kill switch
-
-```python
-import trustlayer as tl
-
-# Check if agent is killed before running
-tl.gate.assert_alive(agent_id="agt_YOUR_AGENT_ID")
-```
-
-### OpenAI / LLM auto-capture
-
-```python
-import trustlayer as tl
 import openai
+import trustlayer as tl
 
-tl.init(api_key="tl_live_YOUR_KEY", human_sponsor="you@company.com")
+tracker = tl.init(api_key="tl_live_YOUR_KEY", auto_capture=False)
 
-# Patch OpenAI — all calls auto-tracked
-tl.auto.patch_openai(openai)
+@tracker.track(name="my-agent")
+def my_agent(task: str) -> str:
+    with tracker.llm_call(label="generate", model="gpt-4o", prompt=task) as step:
+        resp = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": task}],
+        )
+        step.prompt_tokens     = resp.usage.prompt_tokens
+        step.completion_tokens = resp.usage.completion_tokens
+        return resp.choices[0].message.content
 
-client = openai.OpenAI()
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "Should I approve this loan?"}]
-)
-# ↑ This run is automatically logged to FORMA
+# For tools:  with tracker.tool_call("send_email", {"to": addr}): ...
+```
+
+## Kill switch
+
+Pass `kill_switch=True` to `@tl.agent(...)` (or `tl.init(kill_switch=True)`). When you trigger a kill from the dashboard, the next LLM/tool call raises `KillSwitchTriggered` in under ~100 ms.
+
+## CI/CD compliance gate
+
+```bash
+# Blocks the deploy (exit 1) if any agent is below the threshold
+trustlayer gate --pre-deploy --fail-below 80
 ```
 
 ---
 
-## Compliance Coverage
-
-| Framework | Coverage |
-|-----------|---------|
-| **RBI MRM Guidelines** | Model risk, audit trails, human oversight |
-| **DPDP Act (India)** | Data processing records, consent logging |
-| **EU AI Act** | High-risk AI documentation, conformity |
-| **ISO 42001** | AI management system evidence |
-
----
-
-## API Reference
-
-Full API docs: [forma.2bd.net/docs](http://forma.2bd.net/docs)
-
-### `tl.init()`
+## `tl.init()` parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `api_key` | `str` | Your FORMA API key |
-| `human_sponsor` | `str` | Email of accountable human |
-| `agent_name` | `str` | Default agent name |
-| `kill_switch` | `bool` | Enable kill switch checks (default: False) |
-| `gate` | `bool` | Enable gate checks (default: True) |
-| `compliance` | `list[str]` | Frameworks: `["rbi", "dpdp", "eu_ai_act"]` |
+| `api_key` | `str` | Your FORMA API key (`tl_live_…` / `tl_test_…`) |
+| `enforce` | `list[str]` | Framework packs enforced on every call, e.g. `["dpdp"]` |
+| `human_sponsor` | `str` | Accountable human (EU AI Act Art. 14 / RBI) |
+| `auto_capture` | `bool` | Auto-patch OpenAI/Anthropic/LangChain/LiteLLM (default `True`) |
+| `kill_switch` | `bool` | Start the process-level kill watcher (default `False`) |
+| `compliance` | `list[str]` | Frameworks for scoring/reports |
+| `agent_name` | `str` | Display name for ambient auto-captured runs |
 
 ---
 
-## Examples
+## Node.js / TypeScript
 
-See the [`examples/`](examples/) folder for:
-- `basic_agent.py` — minimal integration
-- `real_customer_walkthrough.py` — full compliance flow
-- `my_existing_app.py` — adding FORMA to an existing app
+```bash
+npm install forma-sdk
+```
+
+```ts
+import * as tl from "forma-sdk";
+
+tl.init({ apiKey: "tl_live_YOUR_KEY" });
+
+const myAgent = tl.track(
+  async (task: string) => { /* your code */ return "done"; },
+  { name: "my-agent" },
+);
+```
+
+> **Note:** runtime enforcement (`enforce`), `agent`, and approvals are **Python-only** today. The Node SDK currently provides auto-tracking (`init` + `track`); enforcement parity is on the roadmap.
 
 ---
+
+## Dashboard & docs
+
+- Dashboard: **[forma.2bd.net](https://forma.2bd.net)**
+- Developer guide: [forma.2bd.net/developer-guide](https://forma.2bd.net/developer-guide)
+- Generate a tailored snippet: [forma.2bd.net/snippet-generator](https://forma.2bd.net/snippet-generator)
 
 ## License
 
-MIT — free to use, modify, and distribute. See [LICENSE](LICENSE).
-
----
-
-## Support
-
-- Docs: [forma.2bd.net/developer-guide](http://forma.2bd.net/developer-guide)
-- Issues: [github.com/amit5115/forma-sdk/issues](https://github.com/amit5115/forma-sdk/issues)
+MIT — see [LICENSE](LICENSE).

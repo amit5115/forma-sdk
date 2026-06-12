@@ -85,3 +85,74 @@ class PROVNClient:
         except Exception as exc:
             logger.debug("Gate check failed (allowing by default): %s", exc)
             return {"decision": "allow", "reason": "Gate unreachable — defaulting to allow.", "rule_id": None}
+
+    # ── Enforcement (local gate support) ──────────────────────────────────────
+
+    def _request(self, method: str, path: str, body: Optional[dict] = None, timeout: int = 10):
+        data = json.dumps(body, default=str).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(
+            url=f"{self.base_url}{path}",
+            data=data,
+            headers={"Content-Type": "application/json", "X-API-Key": self.api_key},
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+
+    def get_policy(self, agent_ref: str) -> Optional[Dict[str, Any]]:
+        """Fetch the compiled enforcement policy bundle for an agent."""
+        try:
+            return self._request("GET", f"/api/gate/policy/{urllib.request.quote(agent_ref)}")
+        except Exception as exc:
+            logger.debug("Policy fetch failed for %s: %s", agent_ref, exc)
+            return None
+
+    def apply_policy(self, agent_ref: str, packs: list) -> Optional[Dict[str, Any]]:
+        """Install framework policy packs (e.g. ["dpdp", "rbi_ml_risk"]) on an agent."""
+        try:
+            return self._request(
+                "POST", f"/api/gate/policy/{urllib.request.quote(agent_ref)}/apply",
+                {"packs": packs},
+            )
+        except Exception as exc:
+            logger.debug("Policy apply failed for %s: %s", agent_ref, exc)
+            return None
+
+    def log_gate_decisions(self, entries: list) -> None:
+        """Batch-report locally evaluated gate decisions to the audit trail."""
+        try:
+            self._request("POST", "/api/gate/log", {"entries": entries})
+        except Exception as exc:
+            logger.debug("Gate decision report failed: %s", exc)
+
+    # ── Approvals (human-in-the-loop) ──────────────────────────────────────────
+
+    def create_approval(
+        self,
+        agent_name: str,
+        *,
+        run_id: Optional[str] = None,
+        title: str = "AI decision requires approval",
+        message: Optional[str] = None,
+        payload: Optional[dict] = None,
+        timeout_seconds: int = 3600,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            return self._request("POST", "/api/approvals", {
+                "agent_name": agent_name,
+                "run_id": run_id,
+                "title": title,
+                "message": message,
+                "payload": payload,
+                "timeout_seconds": timeout_seconds,
+            })
+        except Exception as exc:
+            logger.warning("Approval request creation failed: %s", exc)
+            return None
+
+    def get_approval(self, approval_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            return self._request("GET", f"/api/approvals/{approval_id}")
+        except Exception as exc:
+            logger.debug("Approval poll failed: %s", exc)
+            return None

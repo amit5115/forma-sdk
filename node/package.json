@@ -1,7 +1,7 @@
 {
-  "name": "provn-sdk",
+  "name": "forma-sdk",
   "version": "0.6.0",
-  "description": "PROVN AI Agent Governance SDK — cryptographic audit trails, compliance gates, and kill switch in 3 lines",
+  "description": "FORMA AI Compliance SDK — runtime enforcement, cryptographic audit trails, and human approvals in one line",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {

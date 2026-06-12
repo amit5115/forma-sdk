@@ -100,16 +100,29 @@ class RequireApprovalDecorator:
     """
     Returned by tracker.require_approval(...). Wraps a function to pause
     and wait for human approval before returning the result.
+
+    via="forma" (default): creates an approval request in the FORMA
+    Approvals inbox (/approvals in the dashboard) and polls until a human
+    approves/rejects. Both the request and the decision are signed audit
+    events — this is the EU AI Act Article 14 / RBI human-review workflow.
+
+    via="webhook": legacy flow — sends a webhook to `url` and polls the
+    run-level approval status endpoint.
+
+    `when` (optional): callable(result) -> bool. Approval is only required
+    when it returns True — e.g. when=lambda r: r["amount"] > 1_000_000.
     """
 
     def __init__(
         self,
         tracker: Any,
-        via: str = "webhook",
+        via: str = "forma",
         url: Optional[str] = None,
         timeout: int = 3600,
         poll_interval: int = 5,
         message: Optional[str] = None,
+        when: Optional[Callable[[Any], bool]] = None,
+        title: Optional[str] = None,
     ):
         self.tracker = tracker
         self.via = via
@@ -117,6 +130,8 @@ class RequireApprovalDecorator:
         self.timeout = timeout
         self.poll_interval = poll_interval
         self.message = message or "An AI agent is requesting approval to proceed."
+        self.when = when
+        self.title = title
 
     def __call__(self, func: Callable) -> Callable:
         decorator = self
@@ -128,16 +143,28 @@ class RequireApprovalDecorator:
             # Run the agent function
             result = func(*args, **kwargs)
 
+            # Conditional approval: skip when the predicate says it's low-stakes
+            if decorator.when is not None:
+                try:
+                    if not decorator.when(result):
+                        return result
+                except Exception:
+                    pass  # predicate error → default to requiring approval
+
             # Get the current run (set by @track wrapper above this in call stack)
             run = _current_run()
-            run_id = run.run_id if run else "unknown"
+            run_id = run.run_id if run else None
+            agent_name = (run.agent_name if run else None) or getattr(decorator.tracker, "agent_name", None) or func.__name__
 
-            # Send webhook notification
+            if decorator.via == "forma":
+                return decorator._forma_flow(agent_name, run_id, result)
+
+            # ── Legacy webhook flow ────────────────────────────────────────
             if decorator.via == "webhook" and decorator.url:
                 payload = {
                     "event": "approval_required",
                     "run_id": run_id,
-                    "agent_name": run.agent_name if run else "unknown",
+                    "agent_name": agent_name,
                     "human_sponsor": run.human_sponsor if run else "unknown",
                     "message": decorator.message,
                     "result_preview": str(result)[:500],
@@ -147,23 +174,58 @@ class RequireApprovalDecorator:
                 }
                 _send_webhook(decorator.url, payload)
 
-            print(f"[PROVN] ⏸  Run {run_id} is pending human approval. Waiting up to {decorator.timeout}s...")
+            print(f"[FORMA] ⏸  Run {run_id} is pending human approval. Waiting up to {decorator.timeout}s...")
 
-            # Poll for approval decision
             decision = _poll_approval_status(
                 api_url=decorator.tracker.api_url,
                 api_key=decorator.tracker.api_key,
-                run_id=run_id,
+                run_id=run_id or "unknown",
                 poll_interval=decorator.poll_interval,
                 timeout=decorator.timeout,
             )
 
             if decision == "approved":
-                print(f"[PROVN] ✓ Run {run_id} approved by human reviewer.")
+                print(f"[FORMA] ✓ Run {run_id} approved by human reviewer.")
                 return result
             elif decision == "rejected":
-                raise ApprovalRejectedError(run_id=run_id)
+                raise ApprovalRejectedError(run_id=run_id or "unknown")
             else:
-                raise ApprovalTimeoutError(run_id=run_id, timeout=decorator.timeout)
+                raise ApprovalTimeoutError(run_id=run_id or "unknown", timeout=decorator.timeout)
 
         return wrapper
+
+    def _forma_flow(self, agent_name: str, run_id: Optional[str], result: Any):
+        """Create an approval in the FORMA inbox and block until decided."""
+        client = self.tracker._client
+        req = client.create_approval(
+            agent_name=agent_name,
+            run_id=run_id,
+            title=self.title or f"{agent_name}: decision requires approval",
+            message=self.message,
+            payload={"result_preview": str(result)[:1000]},
+            timeout_seconds=self.timeout,
+        )
+        if not req or not req.get("id"):
+            # API unreachable — fail-closed for approvals (a skipped human
+            # review must not silently pass)
+            raise ApprovalTimeoutError(run_id=run_id or "unknown", timeout=0)
+
+        approval_id = req["id"]
+        print(f"[FORMA] ⏸  Approval {approval_id} pending in the FORMA inbox. Waiting up to {self.timeout}s...")
+
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            time.sleep(self.poll_interval)
+            data = client.get_approval(approval_id) or {}
+            status = data.get("status", "pending")
+            if status == "approved":
+                print(f"[FORMA] ✓ Approval {approval_id} approved by {data.get('decided_by', 'reviewer')}.")
+                return result
+            if status == "rejected":
+                raise ApprovalRejectedError(
+                    run_id=approval_id, reason=data.get("decision_reason") or "",
+                )
+            if status == "expired":
+                raise ApprovalTimeoutError(run_id=approval_id, timeout=self.timeout)
+
+        raise ApprovalTimeoutError(run_id=approval_id, timeout=self.timeout)
