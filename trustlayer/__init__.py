@@ -4,7 +4,7 @@ from .models import AgentRun, TraceStep, StepType
 from .approval import ApprovalRejectedError, ApprovalTimeoutError
 from .crypto import generate_keypair, get_public_key_pem, sign_run, verify_run
 
-__version__ = "0.6.0"
+__version__ = "1.1.2"
 
 
 def init(
@@ -82,6 +82,12 @@ def init(
             cache = get_shared_cache(tracker._client)
             if cache:
                 import trustlayer.auto as _auto
+                # Process-wide default: enforce on EVERY agent in this process,
+                # so PII/injection are blocked regardless of the @track/@agent
+                # name used. This makes init(enforce=[...]) truly process-wide.
+                cache.register_default(list(enforce))
+                # Also register the ambient agent so the full server policy
+                # (pack + custom rules) syncs for auto-captured runs.
                 cache.register(_auto._ambient_config["agent_name"], list(enforce))
         except Exception:
             pass  # never fail init due to enforcement setup

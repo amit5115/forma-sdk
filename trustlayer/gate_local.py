@@ -174,6 +174,10 @@ class PolicyCache:
         self._client = client
         self._policies: Dict[str, Dict[str, Any]] = {}
         self._pending_packs: Dict[str, List[str]] = {}
+        # Process-wide fallback policy (set by tl.init(enforce=[...])). Applies
+        # to every agent that has no explicitly-registered policy of its own,
+        # so init-level enforcement is genuinely process-wide.
+        self._default_policy: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
         self._decisions: List[Dict[str, Any]] = []
         self._sync_interval = sync_interval
@@ -200,6 +204,21 @@ class PolicyCache:
         def _setup():
             self._sync_one(agent_name)
         threading.Thread(target=_setup, daemon=True).start()
+        self._ensure_threads()
+
+    def register_default(self, enforce_packs: Optional[List[str]] = None):
+        """
+        Set a process-wide enforcement policy applied to EVERY agent that does
+        not have its own explicitly-registered policy. This makes
+        ``tl.init(enforce=[...])`` genuinely process-wide: PII and prompt
+        injection are blocked locally on every LLM/tool call, regardless of the
+        agent name used by @track/@agent. A per-agent @agent(enforce=[...])
+        policy still takes precedence for that agent.
+        """
+        if not enforce_packs:
+            return
+        with self._lock:
+            self._default_policy = bootstrap_policy("*", enforce_packs)
         self._ensure_threads()
 
     def _sync_one(self, agent_name: str):
@@ -234,6 +253,9 @@ class PolicyCache:
         Every decision is buffered for batch reporting.
         """
         policy = self.get(agent_name)
+        if policy is None:
+            # Fall back to the process-wide default (tl.init(enforce=[...])).
+            policy = self._default_policy
         if policy is None or not policy.get("registered", True):
             return None
         result = evaluate_local(
@@ -241,7 +263,7 @@ class PolicyCache:
             prompt=prompt, tool_name=tool_name, tool_args=tool_args,
         )
         entry = {
-            "agent_id": policy.get("agent_id") or agent_name,
+            "agent_id": agent_name,
             "action_type": action_type,
             "decision": result["decision"],
             "rule_id": result.get("rule_id"),
