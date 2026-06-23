@@ -1,48 +1,151 @@
 """
-HTTP client for sending run data to the PROVN API.
-Sends asynchronously in a background thread so it never blocks the agent.
+HTTP client for the FORMA API.
+
+All requests go through one transport (`_http`) that:
+  • retries transient failures (timeouts, connection errors, 429, 5xx) with
+    exponential backoff + jitter, respecting the server's Retry-After;
+  • attaches an Idempotency-Key on mutating requests so a retry never
+    double-creates (pairs with the server's idempotency middleware);
+  • raises a typed error (FormaAuthError / FormaRateLimitError / FormaAPIError /
+    FormaConnectionError) parsed from the standardized `{error:{code,message}}`.
+
+Best-effort callers (run reporting, gate decision logs) catch and degrade; the
+synchronous gate check fails open by default (configurable via fail_closed).
 """
 import json
 import logging
+import random
+import socket
 import threading
+import time
+import urllib.error
 import urllib.request
+import uuid
 from typing import TYPE_CHECKING, Any, Dict, Optional
+
+from .errors import (
+    FormaAPIError,
+    FormaAuthError,
+    FormaConnectionError,
+    FormaRateLimitError,
+)
 
 if TYPE_CHECKING:
     from .models import AgentRun
 
 logger = logging.getLogger("trustlayer")
 
+_UA = "FORMA-SDK/2.3.16"
+_RETRYABLE_STATUS = lambda s: s == 429 or 500 <= s < 600  # noqa: E731
 
-class PROVNClient:
-    def __init__(self, api_key: str, base_url: str = "https://forma.2bd.net"):
+
+def _parse_error(http_err: urllib.error.HTTPError) -> Dict[str, Any]:
+    try:
+        body = json.loads(http_err.read().decode("utf-8", "replace"))
+        err = body.get("error", {})
+        return {"code": err.get("code"), "message": err.get("message") or http_err.reason}
+    except Exception:
+        return {"code": None, "message": getattr(http_err, "reason", "API error")}
+
+
+def _retry_after(http_err: urllib.error.HTTPError) -> Optional[int]:
+    try:
+        ra = http_err.headers.get("Retry-After")
+        return int(ra) if ra else None
+    except Exception:
+        return None
+
+
+class FormaClient:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://provn-6f5i.onrender.com",
+        *,
+        timeout: int = 10,
+        max_retries: int = 2,
+        fail_closed: bool = False,
+    ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.max_retries = max(0, int(max_retries))
+        self.fail_closed = fail_closed
 
+    # ── Core transport ─────────────────────────────────────────────────────────
+    def _http(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Optional[dict] = None,
+        timeout: Optional[int] = None,
+        idempotent: bool = False,
+        retries: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        timeout = timeout or self.timeout
+        # Per-call retry budget. Defaults to self.max_retries; callers on a latency-
+        # sensitive hot path (the synchronous gate check) pass retries=0 so a
+        # slow/down API fails open fast instead of multiplying LLM latency.
+        max_retries = self.max_retries if retries is None else max(0, int(retries))
+        url = f"{self.base_url}{path}"
+        data = json.dumps(body, default=str).encode("utf-8") if body is not None else None
+        headers = {"X-API-Key": self.api_key, "User-Agent": _UA}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        # one idempotency key for the whole call — reused across retries so a
+        # retried POST is recognised by the server as the same request.
+        if idempotent and method in ("POST", "PUT", "PATCH"):
+            headers["Idempotency-Key"] = uuid.uuid4().hex
+
+        attempt = 0
+        while True:
+            try:
+                req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read()
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                err = _parse_error(exc)
+                if status in (401, 403):
+                    raise FormaAuthError(err["message"], code=err["code"], status=status)
+                if _RETRYABLE_STATUS(status) and attempt < max_retries:
+                    self._backoff(attempt, _retry_after(exc))
+                    attempt += 1
+                    continue
+                if status == 429:
+                    raise FormaRateLimitError(err["message"], retry_after=_retry_after(exc) or 60,
+                                              code=err["code"], status=status)
+                raise FormaAPIError(err["message"], code=err["code"], status=status)
+            except (urllib.error.URLError, TimeoutError, ConnectionError, socket.timeout) as exc:
+                if attempt < max_retries:
+                    self._backoff(attempt, None)
+                    attempt += 1
+                    continue
+                raise FormaConnectionError(str(exc))
+
+    @staticmethod
+    def _backoff(attempt: int, retry_after: Optional[int]) -> None:
+        base = float(retry_after) if retry_after else 0.25 * (2 ** attempt)
+        time.sleep(min(base + random.uniform(0, base * 0.5), 10.0))
+
+    # ── Runs (best-effort, background) ─────────────────────────────────────────
     def send_run(self, run: "AgentRun") -> None:
-        """Send run data to PROVN API in a background thread."""
-        thread = threading.Thread(target=self._post_run, args=(run,), daemon=True)
-        thread.start()
+        threading.Thread(target=self._post_run, args=(run,), daemon=True).start()
 
     def _post_run(self, run: "AgentRun") -> None:
         try:
-            payload = json.dumps(run.to_dict(), default=str).encode("utf-8")
-            req = urllib.request.Request(
-                url=f"{self.base_url}/api/runs",
-                data=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-API-Key": self.api_key,
-                    "Authorization": f"Bearer {self.api_key}",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status not in (200, 201):
-                    logger.warning("PROVN API returned status %s", resp.status)
+            self._http("POST", "/api/runs", body=run.to_dict(), idempotent=True)
         except Exception as exc:
-            logger.warning("Failed to send run to PROVN: %s", exc)
+            # Connection errors are expected offline/in tests — debug level only
+            msg = str(exc)
+            if any(x in msg for x in ("Connection refused", "Connection reset", "Name or service not known")):
+                logger.debug("Failed to send run to FORMA (offline): %s", exc)
+            else:
+                logger.warning("Failed to send run to FORMA: %s", exc)
 
+    # ── Gate (synchronous; fail-open by default, configurable) ─────────────────
     def gate_check(
         self,
         agent_id: str,
@@ -52,52 +155,27 @@ class PROVNClient:
         tool_name: Optional[str] = None,
         tool_args: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Call the compliance gate synchronously before executing an action.
-        Returns {"decision": "allow"|"warn"|"block", "reason": str, ...}
-
-        This is a synchronous call (intentional — it must complete before the
-        action proceeds). It typically returns within 5 ms since it runs
-        locally on the API server with no external dependencies.
-
-        On any network/timeout error, defaults to "allow" so the agent is
-        never blocked by an infrastructure failure.
-        """
         try:
-            payload = json.dumps({
-                "agent_id":    agent_id,
-                "action_type": action_type,
-                "prompt":      prompt,
-                "tool_name":   tool_name,
-                "tool_args":   tool_args,
-            }, default=str).encode("utf-8")
-            req = urllib.request.Request(
-                url=f"{self.base_url}/api/gate/check",
-                data=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-API-Key": self.api_key,
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return json.loads(resp.read())
+            # Hot path: a single fast attempt, no retries. The gate check is a
+            # real-time pre-flight — if the API is slow/down, fail open (or closed)
+            # immediately rather than retrying and stacking seconds onto every call.
+            return self._http("POST", "/api/gate/check", timeout=min(self.timeout, 5),
+                              retries=0, body={
+                "agent_id": agent_id, "action_type": action_type,
+                "prompt": prompt, "tool_name": tool_name, "tool_args": tool_args,
+            })
         except Exception as exc:
+            if self.fail_closed:
+                logger.warning("Gate unreachable — failing CLOSED (blocking): %s", exc)
+                return {"decision": "block", "rule_id": "gate_unreachable",
+                        "reason": "Compliance gate unreachable and fail_closed=True — blocked."}
             logger.debug("Gate check failed (allowing by default): %s", exc)
             return {"decision": "allow", "reason": "Gate unreachable — defaulting to allow.", "rule_id": None}
 
-    # ── Enforcement (local gate support) ──────────────────────────────────────
-
+    # ── Generic request (used by enforcement + approvals helpers) ──────────────
     def _request(self, method: str, path: str, body: Optional[dict] = None, timeout: int = 10):
-        data = json.dumps(body, default=str).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(
-            url=f"{self.base_url}{path}",
-            data=data,
-            headers={"Content-Type": "application/json", "X-API-Key": self.api_key},
-            method=method,
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
+        return self._http(method, path, body=body, timeout=timeout,
+                          idempotent=(method in ("POST", "PUT", "PATCH")))
 
     def get_policy(self, agent_ref: str) -> Optional[Dict[str, Any]]:
         """Fetch the compiled enforcement policy bundle for an agent."""
@@ -110,10 +188,8 @@ class PROVNClient:
     def apply_policy(self, agent_ref: str, packs: list) -> Optional[Dict[str, Any]]:
         """Install framework policy packs (e.g. ["dpdp", "rbi_ml_risk"]) on an agent."""
         try:
-            return self._request(
-                "POST", f"/api/gate/policy/{urllib.request.quote(agent_ref)}/apply",
-                {"packs": packs},
-            )
+            return self._request("POST", f"/api/gate/policy/{urllib.request.quote(agent_ref)}/apply",
+                                  {"packs": packs})
         except Exception as exc:
             logger.debug("Policy apply failed for %s: %s", agent_ref, exc)
             return None
@@ -126,7 +202,6 @@ class PROVNClient:
             logger.debug("Gate decision report failed: %s", exc)
 
     # ── Approvals (human-in-the-loop) ──────────────────────────────────────────
-
     def create_approval(
         self,
         agent_name: str,
@@ -139,12 +214,8 @@ class PROVNClient:
     ) -> Optional[Dict[str, Any]]:
         try:
             return self._request("POST", "/api/approvals", {
-                "agent_name": agent_name,
-                "run_id": run_id,
-                "title": title,
-                "message": message,
-                "payload": payload,
-                "timeout_seconds": timeout_seconds,
+                "agent_name": agent_name, "run_id": run_id, "title": title,
+                "message": message, "payload": payload, "timeout_seconds": timeout_seconds,
             })
         except Exception as exc:
             logger.warning("Approval request creation failed: %s", exc)

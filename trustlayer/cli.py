@@ -1,5 +1,5 @@
 """
-PROVN CLI
+FORMA CLI
 
 Commands:
   trustlayer scan <file.py>         Analyze agent code for compliance gaps
@@ -45,31 +45,37 @@ def _parse_file(path: str) -> ast.Module:
         return ast.parse(f.read(), filename=path)
 
 
-def _find_tracked_functions(tree: ast.Module) -> list[dict]:
-    """Find all functions decorated with @track or @tracker.track."""
-    results = []
+def _find_forma_config(tree: ast.Module) -> dict:
+    """
+    Inspect a file for tl.init() / tl.register() calls and the kwargs they set.
+
+    FORMA has exactly two entry points — init() (process-wide + agents={...})
+    and register() (per-agent) — so a compliance scan checks which governance
+    options the code actually enables.
+    """
+    init_calls = []
+    register_calls = []
+    all_kwargs: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if not isinstance(node, ast.Call):
             continue
-        decorators = [ast.unparse(d) for d in node.decorator_list]
-        is_tracked = any(
-            "track" in d for d in decorators
-        )
-        has_approval = any(
-            "require_approval" in d for d in decorators
-        )
-        has_sponsor = any(
-            "sponsor=" in d for d in decorators
-        )
-        results.append({
-            "name":        node.name,
-            "line":        node.lineno,
-            "is_tracked":  is_tracked,
-            "has_approval": has_approval,
-            "has_sponsor": has_sponsor,
-            "decorators":  decorators,
-        })
-    return results
+        fname = ""
+        if isinstance(node.func, ast.Attribute):
+            fname = node.func.attr
+        elif isinstance(node.func, ast.Name):
+            fname = node.func.id
+        if fname not in ("init", "register"):
+            continue
+        kwargs = {kw.arg for kw in node.keywords if kw.arg}
+        all_kwargs |= kwargs
+        entry = {"line": node.lineno, "kwargs": sorted(kwargs)}
+        (init_calls if fname == "init" else register_calls).append(entry)
+    return {
+        "init_calls":  init_calls,
+        "register_calls": register_calls,
+        "all_kwargs":  all_kwargs,
+        "has_init":    bool(init_calls),
+    }
 
 
 def _find_high_risk_keywords(tree: ast.Module) -> list[tuple[int, str]]:
@@ -104,8 +110,9 @@ def _scan_file(filepath: str, framework: str = "all") -> dict:
     except SyntaxError as e:
         return {"error": f"Syntax error in {filepath}: {e}"}
 
-    tracked   = _find_tracked_functions(tree)
+    config    = _find_forma_config(tree)
     high_risk = _find_high_risk_keywords(tree)
+    kwargs    = config["all_kwargs"]
 
     gaps = {
         "eu_ai_act": [],
@@ -114,74 +121,63 @@ def _scan_file(filepath: str, framework: str = "all") -> dict:
         "iso42001":  [],
     }
 
-    for fn in tracked:
-        if not fn["is_tracked"]:
-            continue
-        fname = fn["name"]
-        line  = fn["line"]
-
-        # EU AI Act Article 14 — human oversight
-        if not fn["has_approval"]:
-            gaps["eu_ai_act"].append({
-                "article": "Article 14",
-                "check":   "Human oversight",
-                "function": fname,
-                "line":    line,
-                "message": f"No @require_approval on {fname}() — add for high-stakes operations",
-                "fix":     f"@tracker.require_approval(via='webhook', url='YOUR_WEBHOOK_URL')",
-            })
-
-        # EU AI Act Article 13 — transparency (human sponsor)
-        if not fn["has_sponsor"]:
-            gaps["eu_ai_act"].append({
-                "article": "Article 13",
-                "check":   "Human sponsor",
-                "function": fname,
-                "line":    line,
-                "message": f"No sponsor= set on @track for {fname}()",
-                "fix":     f"@tracker.track(sponsor='owner@company.com')",
-            })
-
-        # RBI — explainability for financial functions
-        financial_keywords = {"loan", "credit", "payment", "transaction", "transfer", "invest"}
-        if any(k in fname.lower() for k in financial_keywords):
-            gaps["rbi"].append({
-                "article": "RBI ML Model Risk",
-                "check":   "Financial decision explainability",
-                "function": fname,
-                "line":    line,
-                "message": f"{fname}() appears to make financial decisions — RBI requires explainability",
-                "fix":     "Use tracker.llm_call() with descriptive labels for each decision step",
-            })
-
-        # DPDP — automated decision affecting individuals
-        individual_keywords = {"user", "customer", "applicant", "person", "patient", "employee"}
-        params = [a.arg for a in ast.walk(tree) if isinstance(a, ast.arg)]
-        if any(k in p.lower() for p in params for k in individual_keywords):
-            gaps["dpdp"].append({
-                "article": "DPDP Act §13",
-                "check":   "Automated decision transparency",
-                "function": fname,
-                "line":    line,
-                "message": f"{fname}() may affect individuals — DPDP requires purpose disclosure",
-                "fix":     "Add risk_class='high' and a detailed description to agent registration",
-            })
-
-        # ISO 42001 — AI management system
+    # ISO 42001 — is FORMA even initialised?
+    if not config["has_init"]:
         gaps["iso42001"].append({
             "article": "ISO 42001 §6.1",
-            "check":   "AI risk assessment",
-            "function": fname,
-            "line":    line,
-            "message": f"Risk classification for {fname}() not verifiable from code alone",
-            "fix":     "Register agent with risk_class set in PROVN dashboard",
+            "check":   "AI management system",
+            "line":    1,
+            "message": "FORMA is not initialised in this file — no observability or governance",
+            "fix":     "Call tl.init(api_key=..., human_sponsor='owner@company.com') once at startup",
+        })
+
+    # EU AI Act Article 14 — human oversight
+    if "require_approval_when" not in kwargs:
+        gaps["eu_ai_act"].append({
+            "article": "Article 14",
+            "check":   "Human oversight",
+            "line":    1,
+            "message": "No require_approval_when=... configured — high-stakes calls are not paused for review",
+            "fix":     "tl.init(require_approval_when=lambda ctx: ctx['amount'] > 1_000_000)",
+        })
+
+    # EU AI Act Article 13 — transparency (accountable human)
+    if "human_sponsor" not in kwargs:
+        gaps["eu_ai_act"].append({
+            "article": "Article 13",
+            "check":   "Accountable human",
+            "line":    1,
+            "message": "No human_sponsor= set — runs have no accountable owner",
+            "fix":     "tl.init(human_sponsor='owner@company.com')",
+        })
+
+    # DPDP / runtime enforcement — PII + jailbreak blocking
+    if "enforce" not in kwargs:
+        gaps["dpdp"].append({
+            "article": "DPDP Act §8",
+            "check":   "Runtime enforcement",
+            "line":    1,
+            "message": "No enforce=[...] configured — PII and prompt-injection are logged but not blocked",
+            "fix":     "tl.init(enforce=['dpdp', 'rbi_ml_risk'])",
+        })
+
+    # RBI — explainability for financial high-risk operations
+    if high_risk and "enforce" not in kwargs:
+        names = ", ".join(sorted({n for _, n in high_risk})[:4])
+        gaps["rbi"].append({
+            "article": "RBI ML Model Risk",
+            "check":   "Financial decision controls",
+            "line":    high_risk[0][0],
+            "message": f"High-risk operations detected ({names}) without enforce=[...] gating",
+            "fix":     "tl.init(enforce=['rbi_ml_risk']) or per-agent tl.register('agent-name', fn, enforce=['rbi_ml_risk'])",
         })
 
     return {
-        "file":      filepath,
-        "tracked":   tracked,
-        "high_risk": high_risk,
-        "gaps":      gaps,
+        "file":        filepath,
+        "init_calls":  config["init_calls"],
+        "register_calls": config["register_calls"],
+        "high_risk":   high_risk,
+        "gaps":        gaps,
     }
 
 
@@ -190,12 +186,18 @@ def _print_scan_results(findings: dict, framework: str = "all"):
         print(_red(f"  Error: {findings['error']}"))
         return
 
-    tracked = [f for f in findings["tracked"] if f["is_tracked"]]
-    print(f"\n  {_bold('Tracked functions found:')} {len(tracked)}")
-    for fn in tracked:
-        print(f"    {PASS} {_bold(fn['name'])}() at line {fn['line']}")
-        for d in fn["decorators"]:
-            print(f"         {_dim(d)}")
+    init_calls  = findings.get("init_calls", [])
+    register_calls = findings.get("register_calls", [])
+    print(f"\n  {_bold('FORMA configuration:')}")
+    if init_calls:
+        for c in init_calls:
+            kw = ", ".join(c["kwargs"]) or "(no kwargs)"
+            print(f"    {PASS} tl.init({_dim(kw)}) at line {c['line']}")
+    else:
+        print(f"    {FAIL} {_red('No tl.init() call found')}")
+    for c in register_calls:
+        kw = ", ".join(c["kwargs"]) or ""
+        print(f"    {PASS} tl.register({_dim(kw)}) at line {c['line']}")
 
     high_risk = findings["high_risk"]
     if high_risk:
@@ -243,7 +245,7 @@ def _api_get(path: str, api_url: str, api_key: str) -> dict:
 
 def _get_api_config():
     return (
-        os.environ.get("FORMA_API_URL") or os.environ.get("TRUSTLAYER_API_URL") or "https://forma.2bd.net",
+        os.environ.get("FORMA_API_URL") or os.environ.get("TRUSTLAYER_API_URL") or "https://provn-6f5i.onrender.com",
         os.environ.get("FORMA_API_KEY") or os.environ.get("TRUSTLAYER_API_KEY", "dev"),
     )
 
@@ -254,8 +256,83 @@ if HAS_CLICK:
 
     @click.group()
     def main():
-        """PROVN CLI — AI agent compliance tooling."""
+        """FORMA CLI — AI agent compliance tooling."""
         pass
+
+    @main.command()
+    def setup():
+        """One-time guided setup — paste your key, pick a preset, done. (No code needed.)"""
+        config_path = Path.home() / ".forma" / "config.json"
+        print(f"\n{_bold('Welcome to FORMA — the AI Compliance Firewall for India')}")
+        print(_dim("  ~30 seconds. No code knowledge needed.\n"))
+
+        existing = {}
+        try:
+            if config_path.exists():
+                existing = json.loads(config_path.read_text() or "{}")
+        except Exception:
+            existing = {}
+
+        # 1) API key
+        api_key = click.prompt(
+            "  1. Paste your FORMA API key  (get it at formaai.in/settings)",
+            default=existing.get("api_key", ""), show_default=bool(existing.get("api_key")),
+        ).strip()
+        if not api_key:
+            print(f"  {FAIL} {_red('A key is required — sign up free at https://formaai.in/signup')}")
+            sys.exit(1)
+        api_url = os.environ.get("FORMA_API_URL") or "https://provn-6f5i.onrender.com"
+
+        # 2) verify (best effort — never blocks setup)
+        try:
+            me = _api_get("/api/auth/me", api_url, api_key)
+            print(f"  {PASS} {_green('Connected')} as {_bold(me.get('email') or me.get('org_slug') or 'your org')}")
+        except Exception:
+            print(f"  {WARN} {_yellow('Could not reach FORMA right now — saving your key anyway.')}")
+
+        # 3) one plain-English question
+        print(f"\n  2. What does your AI do?")
+        choices = [
+            ("India fintech — lending / KYC / credit   (DPDP + RBI)", "india_fintech"),
+            ("India general — any Indian personal data  (DPDP)",      "india"),
+            ("Healthcare — patient / health data        (DPDP + HIPAA)", "india_health"),
+            ("Global — outside India                    (AI safety only)", "global"),
+        ]
+        for i, (label, _) in enumerate(choices, 1):
+            print(f"     {_bold(str(i))}. {label}")
+        idx = click.prompt("  Pick a number", type=click.IntRange(1, len(choices)), default=1)
+        preset = choices[idx - 1][1]
+
+        # 4) save config
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(
+            {"api_key": api_key, "preset": preset, "api_url": api_url}, indent=2))
+        try:
+            os.chmod(config_path, 0o600)
+        except Exception:
+            pass
+        print(f"\n  {PASS} Saved to {_dim(str(config_path))}")
+
+        # 5) live proof — block a test Aadhaar via the public gate
+        try:
+            body = json.dumps({"prompt": "Customer Aadhaar 2341 1234 1236"}).encode()
+            req = urllib.request.Request(
+                f"{api_url}/api/playground/check", data=body,
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+            if res.get("decision") == "block":
+                print(f"  {PASS} {_green('Your gate is live')} — FORMA just blocked a test Aadhaar.")
+            else:
+                print(f"  {WARN} {_yellow('Gate reachable but did not block the test.')}")
+        except Exception:
+            print(f"  {WARN} {_yellow('Skipped live test (offline) — your gate still runs locally.')}")
+
+        # 6) the entire integration
+        print("\n" + _bold("That's it. Add these 2 lines to the top of your app:") + "\n")
+        print("    " + _green("import trustlayer as tl"))
+        print("    " + _green("tl.init()") + _dim("   # your key + preset load automatically"))
+        print(f"\n  Every AI call is now governed. {_dim('Docs: https://formaai.in/developer-guide')}\n")
 
     @main.command()
     @click.argument("file", type=click.Path(exists=True))
@@ -264,7 +341,7 @@ if HAS_CLICK:
                   help="Compliance framework to check")
     def scan(file, framework):
         """Scan agent code for compliance gaps before deployment."""
-        print(f"\n{_bold('PROVN Compliance Scanner')}")
+        print(f"\n{_bold('FORMA Compliance Scanner')}")
         print(f"  Scanning {_bold(file)} against {_bold(framework)} frameworks...\n")
         findings = _scan_file(file, framework)
         _print_scan_results(findings, framework)
@@ -275,7 +352,7 @@ if HAS_CLICK:
     def verify(run_id):
         """Verify a run's cryptographic signature."""
         api_url, api_key = _get_api_config()
-        print(f"\n{_bold('PROVN Signature Verifier')}")
+        print(f"\n{_bold('FORMA Signature Verifier')}")
         print(f"  Run ID: {run_id}")
         print(f"  API:    {api_url}\n")
         try:
@@ -304,6 +381,90 @@ if HAS_CLICK:
             sys.exit(1)
         print()
 
+    @main.command("verify-decisions")
+    @click.option("--agent", "agent_name", default=None,
+                  help="Filter to a specific agent name")
+    @click.option("--limit", default=200, type=int,
+                  help="Maximum number of entries to verify (default: 200)")
+    def verify_decisions(agent_name, limit):
+        """
+        Verify HMAC signatures on gate decision log entries.
+
+        Proves that no gate decision (allow/warn/block) was altered after the
+        fact — tamper-evident audit trail. Exits with code 1 if any entry fails.
+
+        \\b
+          trustlayer verify-decisions --agent loan-approval-agent --limit 500
+        """
+        api_url, api_key = _get_api_config()
+        print(f"\n{_bold('FORMA Decision Log Verifier')}")
+        if agent_name:
+            print(f"  Agent:  {agent_name}")
+        print(f"  Limit:  {limit}")
+        print(f"  API:    {api_url}\n")
+
+        try:
+            path = f"/api/gate/log?limit={limit}"
+            if agent_name:
+                path += f"&agent={agent_name}"
+            data = _api_get(path, api_url, api_key)
+            entries = data if isinstance(data, list) else data.get("entries", data.get("logs", []))
+
+            if not entries:
+                print(f"  {WARN} {_yellow('No gate decisions found for the given filter.')}")
+                print()
+                return
+
+            # Verify HMAC signatures locally using the same key. Recompute over
+            # the same canonical field set the SDK signed (_SIGNED_FIELDS) — NOT
+            # the whole row — so the server's agent_id resolution and the added
+            # id/created_at fields don't break verification.
+            from trustlayer.gate_local import _SIGNED_FIELDS
+            passed = failed = unsigned = 0
+            for e in entries:
+                if not e.get("_sig"):
+                    unsigned += 1
+                    continue
+                import hashlib as _h, hmac as _hmac, json as _j
+                signed = {k: e.get(k) for k in _SIGNED_FIELDS}
+                payload = _j.dumps(signed, sort_keys=True, separators=(",", ":"), default=str)
+                expected = "hmac-sha256:" + _hmac.new(
+                    api_key.encode(), payload.encode(), _h.sha256,
+                ).hexdigest()
+                if _hmac.compare_digest(e["_sig"], expected):
+                    passed += 1
+                else:
+                    failed += 1
+
+            total = passed + failed + unsigned
+            block_count = sum(1 for e in entries if e.get("decision") == "block")
+            warn_count  = sum(1 for e in entries if e.get("decision") == "warn")
+            allow_count = sum(1 for e in entries if e.get("decision") == "allow")
+
+            if failed == 0 and unsigned == 0:
+                print(f"  {PASS} {_green(f'{total} decisions verified — all signatures valid.')}")
+            elif failed > 0:
+                print(f"  {FAIL} {_red(f'TAMPERED — {failed} decision(s) have invalid signatures!')}")
+            elif unsigned > 0:
+                print(f"  {WARN} {_yellow(f'{unsigned} unsigned entries (may predate v2.3.0).')}")
+                if passed > 0:
+                    print(f"  {PASS} {_green(f'{passed} signed entries verified.')}")
+
+            print(f"  Blocked: {block_count}  |  Warned: {warn_count}  |  Allowed: {allow_count}")
+            if failed == 0:
+                # Top rule
+                from collections import Counter
+                top = Counter(e.get("rule_id") for e in entries if e.get("rule_id")).most_common(1)
+                if top:
+                    print(f"  Top rule: {_bold(top[0][0])} ({top[0][1]} hits)")
+            print()
+
+            if failed > 0:
+                sys.exit(1)
+        except Exception as exc:
+            print(f"  {FAIL} {_red(f'Verification failed: {exc}')}")
+            sys.exit(1)
+
     @main.command("export")
     @click.argument("run_id")
     @click.option("--output", "-o", default=None, help="Output file path (default: evidence_{run_id}.pdf)")
@@ -311,7 +472,7 @@ if HAS_CLICK:
         """Download and save an evidence PDF for a run."""
         api_url, api_key = _get_api_config()
         output = output or f"evidence_{run_id[:8]}.pdf"
-        print(f"\n{_bold('PROVN Evidence Exporter')}")
+        print(f"\n{_bold('FORMA Evidence Exporter')}")
         print(f"  Run ID: {run_id}")
         print(f"  Saving to: {output}\n")
         try:
@@ -333,9 +494,9 @@ if HAS_CLICK:
 
     @main.command()
     def status():
-        """Check PROVN API connection and fleet overview."""
+        """Check FORMA API connection and fleet overview."""
         api_url, api_key = _get_api_config()
-        print(f"\n{_bold('PROVN Status')}")
+        print(f"\n{_bold('FORMA Status')}")
         print(f"  API URL: {api_url}")
         try:
             health = _api_get("/health", api_url, api_key)
@@ -346,32 +507,32 @@ if HAS_CLICK:
             print(f"  Compliance: {stats.get('overall_compliance', 0):.0f}%")
         except Exception as exc:
             print(f"  {FAIL} {_red(f'Cannot reach API: {exc}')}")
-            print(f"  Make sure TRUSTLAYER_API_URL is set correctly.")
+            print(f"  Make sure FORMA_API_URL is set correctly.")
             sys.exit(1)
         print()
 
     @main.command()
-    @click.option("--output-dir", default=None, help="Directory to save keys (default: ~/.provn/)")
+    @click.option("--output-dir", default=None, help="Directory to save keys (default: ~/.forma/)")
     @click.option("--force", is_flag=True, default=False, help="Overwrite existing keys")
     def keygen(output_dir, force):
         """
         Generate an Ed25519 keypair for cryptographically signing agent runs.
 
         Creates two files:
-          ~/.provn/signing_key.pem      — private key (keep secret)
-          ~/.provn/signing_key.pub.pem  — public key (share with auditors)
+          ~/.forma/signing_key.pem      — private key (keep secret)
+          ~/.forma/signing_key.pub.pem  — public key (share with auditors)
 
         Then set:
-          export TRUSTLAYER_SIGNING_KEY_PEM=$(cat ~/.provn/signing_key.pem)
+          export TRUSTLAYER_SIGNING_KEY_PEM=$(cat ~/.forma/signing_key.pem)
 
         Anyone with the public key can verify any run signature without your API key.
         """
         from pathlib import Path
-        key_dir = Path(output_dir) if output_dir else Path.home() / ".provn"
+        key_dir = Path(output_dir) if output_dir else Path.home() / ".forma"
         priv_path = key_dir / "signing_key.pem"
         pub_path  = key_dir / "signing_key.pub.pem"
 
-        print(f"\n{_bold('PROVN Ed25519 Key Generator')}")
+        print(f"\n{_bold('FORMA Ed25519 Key Generator')}")
 
         if priv_path.exists() and not force:
             print(f"  {WARN} {_yellow('Keys already exist at')} {key_dir}")
@@ -399,18 +560,18 @@ if HAS_CLICK:
         print()
 
     @main.command()
-    @click.argument("policy_file", default=".provn/policies.yaml",
+    @click.argument("policy_file", default=".forma/policies.yaml",
                     type=click.Path(), required=False)
     @click.option("--dry-run", is_flag=True, default=False,
                   help="Preview changes without applying them")
     def apply(policy_file, dry_run):
         """
-        Apply .provn/policies.yaml governance policies to the PROVN API.
+        Apply .forma/policies.yaml governance policies to the FORMA API.
 
         This enables Governance-as-Code — policies live in your git repo,
         get reviewed in pull requests, and are applied like any other config.
 
-        Example .provn/policies.yaml:
+        Example .forma/policies.yaml:
         \\b
           agents:
             loan-approval-agent:
@@ -432,7 +593,7 @@ if HAS_CLICK:
         policy_path = Path(policy_file)
         if not policy_path.exists():
             print(f"  {FAIL} {_red(f'Policy file not found: {policy_file}')}")
-            print(f"  Create {_bold('.provn/policies.yaml')} in your project root.")
+            print(f"  Create {_bold('.forma/policies.yaml')} in your project root.")
             sys.exit(1)
 
         api_url, api_key = _get_api_config()
@@ -440,7 +601,7 @@ if HAS_CLICK:
             policies = yaml.safe_load(f)
 
         agents = policies.get("agents", {})
-        print(f"\n{_bold('PROVN Policy Apply')}")
+        print(f"\n{_bold('FORMA Policy Apply')}")
         print(f"  Policy file: {policy_path}")
         print(f"  Agents:      {len(agents)}")
         if dry_run:
@@ -476,7 +637,7 @@ if HAS_CLICK:
                 agent_list  = agents_resp if isinstance(agents_resp, list) else agents_resp.get("agents", [])
                 matched     = [a for a in agent_list if a.get("name") == agent_name]
                 if not matched:
-                    print(f"    {WARN} {_yellow('Agent not found in PROVN')} — will apply on first run")
+                    print(f"    {WARN} {_yellow('Agent not found in FORMA')} — will apply on first run")
                     applied += 1
                     continue
 
@@ -506,7 +667,7 @@ if HAS_CLICK:
     @click.option("--pre-deploy", is_flag=True, default=False,
                   help="Run pre-deployment compliance gate check")
     @click.option("--agent", "agent_name", default=None,
-                  help="Agent name to check (default: all agents in .provn/policies.yaml)")
+                  help="Agent name to check (default: all agents in .forma/policies.yaml)")
     @click.option("--commit", default=None, help="Git commit SHA being deployed")
     @click.option("--fail-below", default=70.0, type=float,
                   help="Fail if compliance score is below this threshold (default: 70)")
@@ -522,7 +683,7 @@ if HAS_CLICK:
         Exits with code 1 if any agent fails the gate, blocking the deploy pipeline.
         """
         api_url, api_key = _get_api_config()
-        print(f"\n{_bold('PROVN Pre-Deploy Gate Check')}")
+        print(f"\n{_bold('FORMA Pre-Deploy Gate Check')}")
         if commit:
             print(f"  Commit: {commit[:8]}")
         print(f"  Threshold: {fail_below}%")
@@ -560,7 +721,7 @@ if HAS_CLICK:
 else:
     # Minimal fallback without click
     def main():
-        print("PROVN CLI requires 'click': pip install trustlayer-sdk[cli]")
+        print("FORMA CLI requires 'click': pip install forma-sdk[cli]")
         sys.exit(1)
 
 

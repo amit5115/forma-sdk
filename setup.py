@@ -2,14 +2,14 @@ from setuptools import setup, find_packages
 
 setup(
     name="forma-sdk",
-    version="1.1.2",
+    version="2.3.16",
     description="FORMA — AI agent compliance SDK. Zero-config tracking, EU AI Act/DPDP/RBI compliance, cryptographic audit trails.",
     long_description=open("README.md").read() if __import__("os").path.exists("README.md") else "",
     long_description_content_type="text/markdown",
     author="FORMA",
-    author_email="sdk@forma.ai",
+    author_email="sdk@formaai.in",
     url="https://github.com/amit5115/forma-sdk",
-    packages=find_packages(include=["trustlayer*", "provn*"]),
+    packages=find_packages(include=["trustlayer*"]),
     python_requires=">=3.8",
     install_requires=[
         "httpx>=0.24.0",
@@ -25,8 +25,8 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "provn=provn.cli:main",
             "trustlayer=trustlayer.cli:main",
+            "forma=trustlayer.cli:main",
         ],
     },
     classifiers=[

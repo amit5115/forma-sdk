@@ -2,7 +2,7 @@
 Zero-Config Auto-Capture (v2)
 
 Monkey-patches OpenAI, Anthropic, LiteLLM, and LangChain clients so that
-every LLM call is automatically captured into the active PROVN run —
+every LLM call is automatically captured into the active FORMA run —
 without the developer writing any tracking code.
 
 Improvements over v1:
@@ -13,6 +13,7 @@ Improvements over v1:
   - Shadow agent detection for all four providers
 """
 from __future__ import annotations
+import logging
 
 import atexit
 import functools
@@ -43,10 +44,10 @@ _PRICING: dict[str, dict[str, float]] = {
 _DEFAULT_COST = {"input": 0.002, "output": 0.002}
 _patched = False
 
-# ── Ambient run config (populated by PROVNTracker._configure_ambient) ─────────
+# ── Ambient run config (populated by FormaTracker._configure_ambient) ─────────
 
 _ambient_config: dict = {
-    "enabled": False,           # True once provn.init() / trustlayer.init() runs
+    "enabled": False,           # True once trustlayer.init() runs
     "agent_name": "ambient",    # display name for auto-captured runs
     "agent_version": "1.0.0",
     "human_sponsor": "unknown",
@@ -54,13 +55,30 @@ _ambient_config: dict = {
     "gate_enabled": False,      # pre-call compliance gate check
     "kill_event": None,         # threading.Event set by global kill poller
     "api_key": "dev",
-    "api_url": "https://forma.2bd.net",
+    "api_url": "https://provn-6f5i.onrender.com",
+    "timeout": 10,              # transport: init(timeout=)
+    "max_retries": 2,           # transport: init(max_retries=)
+    "fail_closed": False,       # gate fail-closed: init(fail_closed=)
+    "max_cost_usd": None,       # hard per-run cost cap (init(max_cost_usd=))
+    "authorized_actions": None, # allowed tool names (init(authorized_actions=))
+    # Human-in-the-loop: predicate ctx->bool evaluated before each captured call
+    "require_approval_when": None,
+    "approval": {               # approval config (init(approval_*=))
+        "message": None, "title": None, "timeout": 3600,
+        "poll_interval": 5, "via": "forma",
+    },
 }
 
 _ambient_runs: list = []                                   # all pending ambient runs
 _ambient_runs_lock = __import__("threading").Lock()
 _atexit_registered = False
-_ambient_client = None                                     # cached PROVNClient
+_ambient_client = None                                     # cached FormaClient
+
+# Server-gate health (fail-open mode only): when the synchronous gate check can't
+# reach the API, skip it for a short cooldown so a down/slow API doesn't add the
+# gate timeout to EVERY LLM call. The local enforce=[...] path is unaffected.
+_SERVER_GATE_COOLDOWN_SEC = 30.0
+_server_gate_cooldown_until = 0.0
 
 
 def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
@@ -121,7 +139,7 @@ def _flush_shadow_events():
             if not events:
                 continue
             try:
-                api_url = (os.environ.get("FORMA_API_URL") or os.environ.get("TRUSTLAYER_API_URL") or "https://forma.2bd.net").rstrip("/")
+                api_url = (os.environ.get("FORMA_API_URL") or os.environ.get("TRUSTLAYER_API_URL") or "https://provn-6f5i.onrender.com").rstrip("/")
                 api_key = os.environ.get("FORMA_API_KEY") or os.environ.get("TRUSTLAYER_API_KEY", "dev")
                 payload = json.dumps({"events": events}).encode()
                 req = urllib.request.Request(
@@ -130,8 +148,8 @@ def _flush_shadow_events():
                     method="POST",
                 )
                 urllib.request.urlopen(req, timeout=10)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
 
     threading.Thread(target=_loop, daemon=True).start()
 
@@ -139,13 +157,16 @@ def _flush_shadow_events():
 # ── Ambient run helpers ───────────────────────────────────────────────────────
 
 def _get_ambient_client():
-    """Return a cached PROVNClient using the current ambient config."""
+    """Return a cached FormaClient using the current ambient config."""
     global _ambient_client
     if _ambient_client is None:
-        from trustlayer.client import PROVNClient
-        _ambient_client = PROVNClient(
+        from trustlayer.client import FormaClient
+        _ambient_client = FormaClient(
             api_key=_ambient_config["api_key"],
             base_url=_ambient_config["api_url"],
+            timeout=_ambient_config.get("timeout", 10),
+            max_retries=_ambient_config.get("max_retries", 2),
+            fail_closed=_ambient_config.get("fail_closed", False),
         )
     return _ambient_client
 
@@ -194,48 +215,121 @@ def _ensure_ambient_run():
 
 
 def _check_kill():
-    """Raise KillSwitchTriggered immediately if the global kill event is set."""
+    """Raise KillSwitchTriggered if a kill event is set — per-agent scope first
+    (tl.register(..., kill_switch=True)), then the process-wide ambient watch
+    (tl.init(kill_switch=True))."""
+    from trustlayer.tracker import _current_scope, KillSwitchTriggered
+
+    scope = _current_scope()
+    if scope:
+        scope_event = scope.get("kill_event")
+        if scope_event is not None and scope_event.is_set():
+            raise KillSwitchTriggered(
+                f"Kill switch triggered for agent '{scope.get('agent_name')}'"
+            )
+
     kill_event = _ambient_config.get("kill_event")
     if kill_event is not None and kill_event.is_set():
-        from trustlayer.tracker import KillSwitchTriggered
         raise KillSwitchTriggered(
             f"Kill switch triggered for agent '{_ambient_config['agent_name']}'"
         )
 
 
+_GATE_SCAN_CAP = 8000  # bound worst-case scan cost on pathologically large prompts
+
+
 def _extract_prompt(kwargs: dict) -> "str | None":
-    """Pull the last user message text from OpenAI-style messages for gate checking."""
+    """Concatenate ALL developer-provided message text (system + user + tool
+    results) so the gate sees PII / injection ANYWHERE in the request.
+
+    Previously this returned only the LAST user message's first 500 chars, which
+    silently let PII bypass the gate in three common shapes: PII in an earlier
+    user message, in the system prompt, or past char 500 of a long prompt — all
+    still sent to the LLM but never scanned. assistant messages (the model's own
+    prior output) are excluded to avoid injection false-positives on them.
+    """
+    parts: list = []
+
+    # Anthropic puts the system prompt in a SEPARATE top-level `system` kwarg
+    # (not in messages). It can be a plain string or a list of text blocks
+    # (system + cache_control). Without this, PII/injection in an Anthropic
+    # system prompt was never scanned.
+    system = kwargs.get("system")
+    if isinstance(system, str):
+        if system:
+            parts.append(system)
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                txt = block.get("text", "") or ""
+                if txt:
+                    parts.append(txt)
+
     messages = kwargs.get("messages") or []
-    for msg in reversed(messages):
+    for msg in messages:
         if not isinstance(msg, dict):
             continue
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                return content[:500]
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        return part.get("text", "")[:500]
-    return None
+        if msg.get("role") not in ("user", "system", "tool"):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            if content:
+                parts.append(content)
+        elif isinstance(content, list):
+            # OpenAI multimodal content: list of {type, text|...} parts.
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    txt = part.get("text", "") or ""
+                    if txt:
+                        parts.append(txt)
+        if sum(len(p) for p in parts) >= _GATE_SCAN_CAP:
+            break  # enough text gathered; stop before scanning megabytes
+    if not parts:
+        return None
+    return "\n".join(parts)[:_GATE_SCAN_CAP]
+
+
+def _extract_langchain_prompts(prompts) -> "str | None":
+    """Concatenate ALL string prompts in a LangChain batch — not just prompts[0],
+    which let PII in a later batch entry bypass the gate."""
+    if not prompts:
+        return None
+    parts = [p for p in prompts if isinstance(p, str) and p]
+    if not parts:
+        return None
+    return "\n".join(parts)[:_GATE_SCAN_CAP]
+
+
+def _provider_from_model(model: str) -> str:
+    m = (model or "").lower()
+    if "gpt" in m or m.startswith("o1") or m.startswith("o3"):
+        return "openai"
+    if "claude" in m:
+        return "anthropic"
+    if "gemini" in m:
+        return "google"
+    return "other"
 
 
 def _maybe_gate_check(model: str, prompt: "str | None" = None) -> None:
     """
-    Pre-call compliance gate check. Raises ComplianceViolation on "block".
+    Pre-call compliance gate + human-approval check.
 
     Order:
       1. Local cached policy for the active agent (set via enforce=[...] or
-         init(enforce=[...])) — <1ms, no network hop.
+         init(enforce=[...]) or the active tl.using scope) — <1ms, no hop.
       2. Server-side gate check, only when gate_enabled and no local policy.
-    On any infrastructure error the call is allowed through (fail-open).
+      3. Human approval (require_approval_when) once the gate has allowed.
+    Raises ComplianceViolation on "block". On gate infrastructure error the
+    call is allowed through (fail-open); approvals fail closed.
     """
     from trustlayer.tracker import ComplianceViolation
 
-    # Resolve which agent this call belongs to: decorated run > ambient agent
+    # Resolve which agent this call belongs to: active run (scope/ambient).
     run = _get_current_run()
     agent_name = (run.agent_name if run is not None else None) or _ambient_config["agent_name"]
 
+    decided = False
     # 1. Local enforcement (policy cached by enforce=[...])
     try:
         from trustlayer.gate_local import get_shared_cache
@@ -243,42 +337,140 @@ def _maybe_gate_check(model: str, prompt: "str | None" = None) -> None:
         if cache:
             result = cache.check(agent_name, action_type="llm_call", prompt=prompt)
             if result is not None:
+                decided = True
                 if result.get("decision") == "block":
                     raise ComplianceViolation(
                         reason=result.get("reason", "Compliance gate blocked this LLM call."),
                         rule_id=result.get("rule_id"),
                     )
-                return
     except ComplianceViolation:
         raise
-    except Exception:
-        pass
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
 
-    # 2. Server fallback
-    if not _ambient_config.get("gate_enabled"):
-        return
-    try:
-        result = _get_ambient_client().gate_check(
-            agent_id=agent_name,
-            action_type="llm_call",
-            prompt=prompt,
+    # 2. Server fallback (only if no local policy decided)
+    if not decided and _ambient_config.get("gate_enabled"):
+        global _server_gate_cooldown_until
+        fail_closed = bool(_ambient_config.get("fail_closed"))
+        # In fail-open mode, skip the server gate while in cooldown so a down API
+        # doesn't add the gate timeout to every call. fail_closed must always try
+        # (it blocks when the gate can't be reached, so skipping would be unsafe).
+        if not fail_closed and time.time() < _server_gate_cooldown_until:
+            pass
+        else:
+            try:
+                result = _get_ambient_client().gate_check(
+                    agent_id=agent_name,
+                    action_type="llm_call",
+                    prompt=prompt,
+                )
+                if result.get("decision") == "block":
+                    raise ComplianceViolation(
+                        reason=result.get("reason", "Compliance gate blocked this LLM call."),
+                        rule_id=result.get("rule_id"),
+                    )
+                # Gate unreachable (fail-open sentinel) → start a cooldown so the
+                # next calls don't each eat the gate timeout.
+                if result.get("rule_id") == "gate_unreachable" or \
+                        str(result.get("reason", "")).startswith("Gate unreachable"):
+                    _server_gate_cooldown_until = time.time() + _SERVER_GATE_COOLDOWN_SEC
+            except ComplianceViolation:
+                raise
+            except Exception:
+                # fail-open: never block a call due to gate infrastructure failure
+                _server_gate_cooldown_until = time.time() + _SERVER_GATE_COOLDOWN_SEC
+
+    # 3. Human-in-the-loop approval (after the gate allows).
+    _maybe_require_approval(
+        model, action_type="llm_call", prompt=prompt,
+        provider=_provider_from_model(model),
+    )
+
+
+def _resolve_approval_config():
+    """
+    Resolve the active human-approval config in priority order:
+    active tl.using(...) scope -> process-wide init() ambient default.
+    Returns (predicate, approval_dict, agent_name).
+    """
+    from trustlayer.tracker import _current_scope
+    scope = _current_scope()
+    if scope and scope.get("require_approval_when") is not None:
+        return (
+            scope["require_approval_when"],
+            scope.get("approval") or {},
+            scope.get("agent_name") or _ambient_config["agent_name"],
         )
-        if result.get("decision") == "block":
-            raise ComplianceViolation(
-                reason=result.get("reason", "Compliance gate blocked this LLM call."),
-                rule_id=result.get("rule_id"),
-            )
-    except ComplianceViolation:
-        raise
+    run = _get_current_run()
+    agent_name = (run.agent_name if run is not None else None) or _ambient_config["agent_name"]
+    return (
+        _ambient_config.get("require_approval_when"),
+        _ambient_config.get("approval") or {},
+        agent_name,
+    )
+
+
+def _maybe_require_approval(
+    model: str,
+    *,
+    action_type: str = "llm_call",
+    prompt: "str | None" = None,
+    tool_name: "str | None" = None,
+    tool_args: "dict | None" = None,
+    provider: str = "other",
+) -> None:
+    """
+    Human-in-the-loop gate. If a ``require_approval_when`` predicate is
+    configured (via tl.init or the active tl.using scope) and it returns True
+    for this call's context, pause until a human approves in the FORMA inbox.
+
+    Raises ApprovalRejectedError / ApprovalTimeoutError on a negative outcome.
+    A predicate that raises is treated as fail-closed (approval required).
+    """
+    predicate, approval, agent_name = _resolve_approval_config()
+    if predicate is None:
+        return
+
+    ctx = {
+        "agent_name": agent_name,
+        "provider": provider,
+        "model": model,
+        "action_type": action_type,
+        "prompt": prompt,
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+    }
+    try:
+        needs = bool(predicate(ctx))
     except Exception:
-        pass  # fail-open: never block a call due to gate infrastructure failure
+        needs = True  # predicate error -> fail-closed (require human review)
+    if not needs:
+        return
+
+    from trustlayer.approval import wait_for_forma_approval
+    run = _get_current_run()
+    run_id = getattr(run, "run_id", None)
+    title = approval.get("title") or f"{agent_name}: decision requires approval"
+    message = approval.get("message") or "An AI agent is requesting approval to proceed."
+    wait_for_forma_approval(
+        _get_ambient_client(),
+        agent_name=agent_name,
+        run_id=run_id,
+        title=title,
+        message=message,
+        payload={"model": model, "action_type": action_type,
+                 "prompt_preview": (prompt or "")[:500],
+                 "tool_name": tool_name},
+        timeout=int(approval.get("timeout") or 3600),
+        poll_interval=int(approval.get("poll_interval") or 5),
+    )
 
 
 def _flush_ambient_run(run) -> None:
     """Finalize and synchronously POST a single ambient run to the API."""
-    if getattr(run, "_provn_flushed", False) or not run.steps:
+    if getattr(run, "_forma_flushed", False) or not run.steps:
         return
-    run._provn_flushed = True  # guard against double-flush
+    run._forma_flushed = True  # guard against double-flush
     try:
         from trustlayer.models import RunStatus
         from trustlayer.crypto import sign_run as _sign_run
@@ -296,11 +488,17 @@ def _flush_ambient_run(run) -> None:
         if run.status == RunStatus.RUNNING:
             run.status = RunStatus.SUCCESS
 
+        # Hard per-run cost cap (init(max_cost_usd=...))
+        max_cost = _ambient_config.get("max_cost_usd")
+        if max_cost is not None and run.total_cost_usd > max_cost:
+            run.status = RunStatus.FAILED
+            run.error = f"Cost limit exceeded: ${run.total_cost_usd:.4f} > ${max_cost}"
+
         run_dict = run.to_dict()
         run.signature = _sign_run(run_dict, secret_key=_ambient_config["api_key"])
         _get_ambient_client()._post_run(run)  # synchronous — safe inside atexit
-    except Exception:
-        pass
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
 
 
 def _flush_all_ambient_runs() -> None:
@@ -390,8 +588,8 @@ def _patch_openai():
                     choices = getattr(response, "choices", [])
                     if choices:
                         finish_reason = getattr(choices[0], "finish_reason", None)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
             _add_llm_step(f"OpenAI {model}", model, prompt_tokens,
                           completion_tokens, duration_ms, finish_reason, error)
 
@@ -431,15 +629,15 @@ def _patch_openai():
                             choices = getattr(response, "choices", [])
                             if choices:
                                 finish_reason = getattr(choices[0], "finish_reason", None)
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
                     _add_llm_step(f"OpenAI {model}", model, prompt_tokens,
                                   completion_tokens, duration_ms, finish_reason, error)
 
             AsyncCompletions.create = patched_acreate
             AsyncCompletions._trustlayer_patched = True  # type: ignore[attr-defined]
-    except (ImportError, AttributeError):
-        pass
+    except (ImportError, AttributeError) as _exc:
+        logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
 
 
 # ── Anthropic patcher (class-level, sync + async) ────────────────────────────
@@ -479,8 +677,8 @@ def _patch_anthropic():
                     if usage:
                         prompt_tokens = getattr(usage, "input_tokens", 0) or 0
                         completion_tokens = getattr(usage, "output_tokens", 0) or 0
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
             _add_llm_step(f"Anthropic {model}", model, prompt_tokens,
                           completion_tokens, duration_ms, error=error)
 
@@ -517,15 +715,15 @@ def _patch_anthropic():
                             if usage:
                                 prompt_tokens = getattr(usage, "input_tokens", 0) or 0
                                 completion_tokens = getattr(usage, "output_tokens", 0) or 0
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
                     _add_llm_step(f"Anthropic {model}", model, prompt_tokens,
                                   completion_tokens, duration_ms, error=error)
 
             AsyncMessages.create = patched_acreate
             AsyncMessages._trustlayer_patched = True  # type: ignore[attr-defined]
-    except (ImportError, AttributeError):
-        pass
+    except (ImportError, AttributeError) as _exc:
+        logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
 
 
 # ── LiteLLM patcher (module-level function, sync + async) ────────────────────
@@ -573,8 +771,8 @@ def _patch_litellm():
                     choices = getattr(response, "choices", [])
                     if choices:
                         finish_reason = getattr(choices[0], "finish_reason", None)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
             _add_llm_step(f"LiteLLM {model}", str(model), prompt_tokens,
                           completion_tokens, duration_ms, finish_reason, error)
 
@@ -615,14 +813,14 @@ def _patch_litellm():
                         choices = getattr(response, "choices", [])
                         if choices:
                             finish_reason = getattr(choices[0], "finish_reason", None)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
                 _add_llm_step(f"LiteLLM {model}", str(model), prompt_tokens,
                               completion_tokens, duration_ms, finish_reason, error)
 
         litellm.acompletion = patched_acompletion
-    except AttributeError:
-        pass
+    except AttributeError as _exc:
+        logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
 
     litellm._trustlayer_patched = True  # type: ignore[attr-defined]
 
@@ -658,7 +856,7 @@ def _patch_langchain():
         _check_kill()
         _maybe_gate_check(
             str(getattr(self, "model_name", None) or getattr(self, "model", None) or "langchain"),
-            prompts[0] if prompts and isinstance(prompts[0], str) else None,
+            _extract_langchain_prompts(prompts),
         )
         _ensure_ambient_run()
         t0 = time.monotonic()
@@ -682,8 +880,8 @@ def _patch_langchain():
                     usage = llm_out.get("token_usage", {}) or {}
                     prompt_tokens = usage.get("prompt_tokens", 0)
                     completion_tokens = usage.get("completion_tokens", 0)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
             _add_llm_step(f"LangChain {model_name}", str(model_name),
                           prompt_tokens, completion_tokens, duration_ms, error=error)
 
@@ -698,7 +896,7 @@ def _patch_langchain():
             _check_kill()
             _maybe_gate_check(
                 str(getattr(self, "model_name", None) or getattr(self, "model", None) or "langchain"),
-                prompts[0] if prompts and isinstance(prompts[0], str) else None,
+                _extract_langchain_prompts(prompts),
             )
             _ensure_ambient_run()
             t0 = time.monotonic()
@@ -722,14 +920,14 @@ def _patch_langchain():
                         usage = llm_out.get("token_usage", {}) or {}
                         prompt_tokens = usage.get("prompt_tokens", 0)
                         completion_tokens = usage.get("completion_tokens", 0)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
                 _add_llm_step(f"LangChain {model_name}", str(model_name),
                               prompt_tokens, completion_tokens, duration_ms, error=error)
 
         BaseLLM._agenerate = patched_agenerate  # type: ignore[attr-defined]
-    except AttributeError:
-        pass
+    except AttributeError as _exc:
+        logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
 
     BaseLLM._trustlayer_patched = True  # type: ignore[attr-defined]
 
@@ -739,7 +937,7 @@ def _patch_langchain():
 def patch_all():
     """
     Patch all supported LLM clients. Idempotent — safe to call multiple times.
-    Called automatically when auto_capture=True on PROVNTracker.
+    Called automatically when auto_capture=True on FormaTracker.
 
     Patched providers:
       - OpenAI  (sync + async, openai>=1.0)

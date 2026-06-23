@@ -1,43 +1,260 @@
 """
-Core @track decorator — wraps any agent function and captures:
+Core tracking engine. Configured via tl.init() and scoped via tl.using();
+there are no decorators. Captures:
   - Every LLM call (auto via monkey-patch OR manual via llm_call())
   - Every tool call (via tool_call() context manager)
   - Full run metadata with human sponsor attribution
   - Cryptographic signature on completion (Ed25519 or HMAC-SHA256 fallback)
   - Optional: hard cost limit enforcement (max_cost_usd)
-  - Optional: human approval workflow (require_approval)
+  - Optional: human approval workflow (require_approval_when=)
   - Optional: kill switch via WebSocket push (<50ms) with HTTP polling fallback
   - Optional: multi-agent chain audit (chain_parent=run_id)
 """
+import asyncio
+import contextvars
 import functools
-import hashlib
+import inspect
+import logging
 import json
 import os
+import sys
 import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Generator, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
-from .client import PROVNClient
+from .client import FormaClient
 from .crypto import sign_run
 from .models import AgentRun, RunStatus, StepType, TraceStep
 
-_local = threading.local()
+
+def _forma_config() -> dict:
+    """Read ~/.forma/config.json (written by `forma setup`) for zero-config init.
+
+    Lets a non-technical user run `forma setup` once and then have a bare
+    ``tl.init()`` (no api_key, no enforce) pick up the saved key + preset.
+    Never raises — returns {} on any error or missing file.
+    """
+    try:
+        path = os.path.join(os.path.expanduser("~"), ".forma", "config.json")
+        if os.path.exists(path):
+            with open(path) as fh:
+                return json.loads(fh.read() or "{}")
+    except Exception:
+        pass
+    return {}
+
+# ── Context-local state (thread-safe AND asyncio-safe) ───────────────────────
+# We use contextvars (not threading.local) so attribution stays correct when
+# 20+ agents run concurrently across threads OR asyncio tasks. asyncio copies
+# the context per-task, and worker threads start with an empty context, so each
+# concurrent unit of work resolves its own current run + scope stack.
+_current_run_var: "contextvars.ContextVar[Optional[AgentRun]]" = contextvars.ContextVar(
+    "forma_current_run", default=None
+)
+_scope_stack_var: "contextvars.ContextVar[Tuple[Dict[str, Any], ...]]" = contextvars.ContextVar(
+    "forma_scope_stack", default=()
+)
 
 
 def _current_run() -> Optional[AgentRun]:
-    return getattr(_local, "current_run", None)
+    return _current_run_var.get()
 
 
 def _set_current_run(run: Optional[AgentRun]) -> None:
-    _local.current_run = run
+    # Ambient (auto-capture) set-and-leave: persists for the rest of the
+    # current context, mirroring the old per-thread behaviour.
+    _current_run_var.set(run)
 
 
-def _hash_payload(data: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(data, sort_keys=True, default=str).encode()
-    ).hexdigest()
+# ── tl.using(...) scope stack ────────────────────────────────────────────────
+# Decorator-free multi-agent: `with tl.using("name", ...)` (or the @tl.using
+# decorator) pushes a per-context scope (a discrete run + per-scope
+# enforce/approval/governance config) that the auto-capture wrappers resolve
+# over the process-wide init defaults. Push/pop use contextvars tokens so the
+# stack is restored exactly, even under concurrency.
+
+def _scope_stack() -> list:
+    # Read-only snapshot for external consumers (auto.py reads via _current_scope).
+    return list(_scope_stack_var.get())
+
+
+def _current_scope() -> Optional[Dict[str, Any]]:
+    stack = _scope_stack_var.get()
+    return stack[-1] if stack else None
+
+
+def _push_run(run: Optional[AgentRun]):
+    return _current_run_var.set(run)
+
+
+def _pop_run(token) -> None:
+    _current_run_var.reset(token)
+
+
+def _push_scope(scope: Dict[str, Any]):
+    return _scope_stack_var.set(_scope_stack_var.get() + (scope,))
+
+
+def _pop_scope(token) -> None:
+    _scope_stack_var.reset(token)
+
+
+class _UsingHandle:
+    """What ``tl.using(...)`` / ``tracker.using(...)`` returns.
+
+    The same object works three ways, so business code never changes shape:
+
+    * **context manager** — ``with tl.using("agent"): ...``
+    * **sync decorator** — ``@tl.using("agent")`` above a regular function
+    * **async decorator** — ``@tl.using("agent")`` above an ``async def`` (the
+      governed scope spans the *awaited* execution, not just coroutine creation)
+
+    Each enter / each decorated call creates a fresh governed run, so a single
+    handle is safely reusable and concurrency-correct (contextvars-backed).
+    """
+
+    __slots__ = ("_tracker", "_name", "_kwargs", "_cm")
+
+    def __init__(self, tracker: "FormaTracker", name: str, kwargs: Dict[str, Any]):
+        self._tracker = tracker
+        self._name = name
+        self._kwargs = kwargs
+        self._cm = None
+
+    def _new_cm(self):
+        return self._tracker._using_cm(self._name, **self._kwargs)
+
+    # context-manager protocol
+    def __enter__(self):
+        self._cm = self._new_cm()
+        return self._cm.__enter__()
+
+    def __exit__(self, *exc_info):
+        return self._cm.__exit__(*exc_info)
+
+    # decorator protocol (sync + async aware)
+    def __call__(self, fn: Callable) -> Callable:
+        name = self._name
+        enforce = self._kwargs.get("enforce")
+
+        tracker_ref = self._tracker
+
+        # Register packs once at wrapper-setup time, not on every call.
+        # If the cache doesn't exist yet (init() had no enforce=) we defer
+        # registration to the first call, then cache the result so subsequent
+        # calls skip the register() overhead entirely.
+        _gate_cache_ref: list = [None]   # list so the closure can rebind it
+        _gate_registered = [False]
+
+        authorized_actions = self._kwargs.get("authorized_actions")
+
+        if enforce:
+            try:
+                from .gate_local import get_shared_cache
+                c = get_shared_cache(tracker_ref._client)
+                if c is not None:
+                    c.register(name, list(enforce),
+                               authorized_actions=authorized_actions)
+                    _gate_cache_ref[0] = c
+                    _gate_registered[0] = True
+            except Exception:
+                pass
+
+        # Register identity passport ONCE at setup time (not on every call).
+        # _using_cm previously called _register_passport on every invocation of
+        # the governed function — at 1000 calls/min this spawned 1000 background
+        # HTTP threads/min. Moving it here means it runs exactly once per
+        # tl.register() / agents= entry, regardless of call volume.
+        _passport_kwargs = self._kwargs
+        _purpose       = _passport_kwargs.get("purpose")
+        _authz         = _passport_kwargs.get("authorized_actions")
+        _risk          = _passport_kwargs.get("risk_level", "MEDIUM")
+        _compliance    = _passport_kwargs.get("compliance")
+        _kill          = _passport_kwargs.get("kill_switch", False)
+        _drift         = _passport_kwargs.get("drift_threshold", 0.15)
+        if _purpose or _authz or _kill or _risk != "MEDIUM":
+            try:
+                tracker_ref._register_passport(
+                    name,
+                    purpose=_purpose or "General AI agent task",
+                    authorized_actions=_authz,
+                    risk_level=_risk,
+                    compliance=_compliance,
+                    kill_switch=_kill,
+                    drift_threshold=_drift,
+                )
+            except Exception:
+                pass
+
+        def _gate_check_inputs(*args, **kwargs) -> None:
+            """Block PII/injection in function arguments before execution."""
+            if not enforce:
+                return
+            # Collect all string values one level deep
+            strings: list = []
+            for a in args:
+                if isinstance(a, str):
+                    strings.append(a)
+                elif isinstance(a, dict):
+                    strings.extend(v for v in a.values() if isinstance(v, str))
+            for v in kwargs.values():
+                if isinstance(v, str):
+                    strings.append(v)
+                elif isinstance(v, dict):
+                    strings.extend(vv for vv in v.values() if isinstance(vv, str))
+            if not strings:
+                return
+            combined = " ".join(strings)
+            try:
+                from .gate_local import get_shared_cache
+                cache = _gate_cache_ref[0]
+                if cache is None:
+                    # First call after deferred init — create + register now
+                    cache = get_shared_cache(tracker_ref._client)
+                    if cache is None:
+                        return
+                    cache.register(name, list(enforce),
+                                   authorized_actions=authorized_actions)
+                    _gate_cache_ref[0] = cache
+                result = cache.check(name, action_type="llm_call", prompt=combined)
+                if result.get("decision") == "block":
+                    from .errors import fmt_compliance_violation
+                    _snip = combined[:120] if combined else None
+                    _pii = result.get("reason","").split("PII detected: ")
+                    _pii_type = _pii[1].split(".")[0] if len(_pii) > 1 else None
+                    raise ComplianceViolation(
+                        fmt_compliance_violation(
+                            reason=result.get("reason", "Policy violation"),
+                            rule_id=result.get("rule_id"),
+                            pii_type=_pii_type,
+                            agent_name=name,
+                            prompt_snippet=_snip,
+                            enforce_packs=list(enforce or []),
+                        )
+                    )
+            except ComplianceViolation:
+                raise
+            except Exception:
+                pass  # gate check failure → fail open (non-blocking)
+
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def _async_wrapper(*args, **kwargs):
+                _gate_check_inputs(*args, **kwargs)
+                with self._new_cm():
+                    return await fn(*args, **kwargs)
+
+            return _async_wrapper
+
+        @functools.wraps(fn)
+        def _sync_wrapper(*args, **kwargs):
+            _gate_check_inputs(*args, **kwargs)
+            with self._new_cm():
+                return fn(*args, **kwargs)
+
+        return _sync_wrapper
 
 
 # ── Kill switch — WebSocket listener with HTTP polling fallback ────────────────
@@ -118,8 +335,8 @@ class _KillPoller:
         finally:
             try:
                 ws.close()
-            except Exception:
-                pass
+            except Exception as _exc:
+                logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
 
     def _poll_loop(self):
         """HTTP polling fallback — latency ~2s."""
@@ -136,8 +353,8 @@ class _KillPoller:
                     if data.get("kill_active"):
                         self._kill_event.set()
                         return
-            except Exception:
-                pass
+            except Exception as _exc:
+                logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
             self._stop_event.wait(timeout=2)
 
 
@@ -151,7 +368,7 @@ class ComplianceViolation(Exception):
     def __init__(self, reason: str, rule_id: Optional[str] = None):
         self.reason = reason
         self.rule_id = rule_id
-        super().__init__(f"[PROVN Gate] Blocked: {reason}")
+        super().__init__(f"[FORMA Gate] Blocked: {reason}")
 
 
 def _infer_app_name() -> str:
@@ -204,10 +421,11 @@ def _register_passport_async(
         pass  # Never fail agent startup due to passport registration
 
 
-class PROVNTracker:
+class FormaTracker:
     """
-    Instantiate once and reuse, or use the module-level @track decorator
-    which uses a default tracker configured from environment variables.
+    Instantiate via tl.init() (which configures and returns a process-wide
+    tracker) and scope per-agent work with tl.using(). Manual instrumentation
+    is available via llm_call() / tool_call() inside a using() block.
     """
 
     def __init__(
@@ -218,25 +436,56 @@ class PROVNTracker:
         agent_version: str = "1.0.0",
         human_sponsor: Optional[str] = None,
         auto_capture: bool = True,
+        timeout: int = 10,
+        max_retries: int = 2,
+        fail_closed: bool = False,
     ):
-        self.api_key = api_key or os.environ.get("TRUSTLAYER_API_KEY", "dev")
+        _cfg = _forma_config()
+        resolved_key = (
+            api_key
+            or os.environ.get("FORMA_API_KEY")
+            or os.environ.get("TRUSTLAYER_API_KEY")
+            or _cfg.get("api_key")
+        )
+        if not resolved_key:
+            import warnings
+            from .errors import fmt_no_key
+            warnings.warn(fmt_no_key(), stacklevel=4)
+        self.api_key = resolved_key or "dev"
         self.api_url = (
             api_url
             or os.environ.get("FORMA_API_URL")
             or os.environ.get("TRUSTLAYER_API_URL")
-            or "https://forma.2bd.net"
+            or _cfg.get("api_url")
+            or "https://provn-6f5i.onrender.com"
         )
         self.agent_name = agent_name
         self.agent_version = agent_version
-        self.human_sponsor = human_sponsor or os.environ.get("TRUSTLAYER_HUMAN_SPONSOR") or None
-        self._client = PROVNClient(api_key=self.api_key, base_url=self.api_url)
+        self.human_sponsor = (
+            human_sponsor
+            or os.environ.get("FORMA_HUMAN_SPONSOR")
+            or os.environ.get("TRUSTLAYER_HUMAN_SPONSOR")
+            or None
+        )
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._fail_closed = fail_closed
+        # Guards the per-agent kill-poller registry so concurrent first-calls to
+        # a kill_switch=True agent don't each spawn a duplicate poller thread.
+        self._kill_lock = threading.Lock()
+        self._agent_kill_pollers: Dict[str, "_KillPoller"] = {}
+        self._global_kill_poller: Optional["_KillPoller"] = None
+        self._client = FormaClient(
+            api_key=self.api_key, base_url=self.api_url,
+            timeout=timeout, max_retries=max_retries, fail_closed=fail_closed,
+        )
 
         if auto_capture:
             try:
                 from .auto import patch_all
                 patch_all()
-            except Exception:
-                pass
+            except Exception as _exc:
+                logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
 
     def _local_or_server_gate(
         self,
@@ -261,217 +510,196 @@ class PROVNTracker:
                 )
                 if result is not None:
                     return result
-        except Exception:
-            pass
+        except Exception as _exc:
+            logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
         return self._client.gate_check(
             agent_id=agent_ref, action_type=action_type,
             prompt=prompt, tool_name=tool_name, tool_args=tool_args,
         )
 
-    def require_approval(
-        self,
-        via: str = "forma",
-        url: Optional[str] = None,
-        timeout: int = 3600,
-        poll_interval: int = 5,
-        message: Optional[str] = None,
-        when: Optional[Callable] = None,
-        title: Optional[str] = None,
-    ):
-        """
-        Human-in-the-loop: pause the agent until a human decides in the
-        FORMA Approvals inbox.
-
-            @tracker.track
-            @tracker.require_approval(
-                when=lambda result: result["amount"] > 1_000_000,
-                message="Loan above ₹10L requires human review (RBI).",
+    # ── Run lifecycle helper (shared by tl.using + ambient flush) ───────────
+    def _finalize_and_send(
+        self, run: AgentRun, *, max_cost_usd: Optional[float] = None,
+    ) -> None:
+        """Finalize timing/cost, sign, and send a run. Idempotent per run."""
+        if getattr(run, "_forma_flushed", False):
+            return
+        run._forma_flushed = True  # type: ignore[attr-defined]
+        if run.ended_at is None:
+            run.ended_at = datetime.now(timezone.utc)
+        if run.started_at and run.ended_at:
+            run.duration_ms = int(
+                (run.ended_at - run.started_at).total_seconds() * 1000
             )
-            def approve_loan(application): ...
-        """
-        from .approval import RequireApprovalDecorator
-        return RequireApprovalDecorator(
-            tracker=self,
-            via=via,
-            url=url,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            message=message,
-            when=when,
-            title=title,
+        run.total_tokens = sum(
+            (s.prompt_tokens or 0) + (s.completion_tokens or 0) for s in run.steps
         )
+        run.total_cost_usd = sum(s.cost_usd or 0.0 for s in run.steps)
+        if max_cost_usd is not None and run.total_cost_usd > max_cost_usd:
+            run.status = RunStatus.FAILED
+            run.error = f"Cost limit exceeded: ${run.total_cost_usd:.4f} > ${max_cost_usd}"
+        if run.status == RunStatus.RUNNING:
+            run.status = RunStatus.SUCCESS
+        run_dict = run.to_dict()
+        run.signature = sign_run(run_dict, secret_key=self.api_key)
+        self._client.send_run(run)
 
-    def agent(
+    def _register_passport(
         self,
-        func: Optional[Callable] = None,
+        name: str,
         *,
-        name: Optional[str] = None,
-        version: Optional[str] = None,
-        sponsor: Optional[str] = None,
-        # Identity Passport params
         purpose: str = "General AI agent task",
         authorized_actions: Optional[List[str]] = None,
         risk_level: str = "MEDIUM",
-        # Kill switch
-        kill_switch: bool = False,
-        # Chain audit
-        chain_parent: Optional[str] = None,
-        chain_id: Optional[str] = None,
-        # Drift detection
-        drift_threshold: float = 0.15,
-        # Compliance
         compliance: Optional[List[str]] = None,
-        # Cost governance
-        max_cost_usd: Optional[float] = None,
-        # Runtime enforcement — framework policy packs evaluated locally
-        # before every LLM/tool call (<1ms, no network hop in the hot path)
+        drift_threshold: float = 0.15,
+        kill_switch: bool = False,
+    ) -> None:
+        """Best-effort, fire-and-forget identity-passport registration."""
+        threading.Thread(
+            target=_register_passport_async,
+            args=(
+                name, purpose, authorized_actions or [], risk_level,
+                self.human_sponsor, kill_switch, compliance or [],
+                drift_threshold, self.api_url, self.api_key,
+            ),
+            daemon=True,
+        ).start()
+
+    def using(
+        self,
+        name: str,
+        *,
         enforce: Optional[List[str]] = None,
-    ):
+        compliance: Optional[List[str]] = None,
+        risk_level: str = "MEDIUM",
+        human_sponsor: Optional[str] = None,
+        purpose: Optional[str] = None,
+        authorized_actions: Optional[List[str]] = None,
+        max_cost_usd: Optional[float] = None,
+        require_approval_when: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        approval_message: Optional[str] = None,
+        approval_title: Optional[str] = None,
+        approval_timeout: int = 3600,
+        approval_poll_interval: int = 5,
+        approval_via: str = "forma",
+        version: Optional[str] = None,
+        kill_switch: bool = False,
+        drift_threshold: float = 0.15,
+    ) -> "_UsingHandle":
         """
-        Full-featured decorator with identity passport, kill switch, chain
-        support, and runtime compliance enforcement.
+        Internal multi-agent scope helper that powers ``tl.register()`` and
+        ``tl.init(agents={...})``. Every auto-captured LLM/tool call inside the
+        scope is attributed to agent ``name`` with its own discrete, signed run
+        and its own enforcement/approval/governance config.
 
-            @tracker.agent(
-                name="loan-approval",
-                purpose="Loan application evaluation",
-                risk_level="HIGH",
-                kill_switch=True,
-                enforce=["rbi_ml_risk", "dpdp"],   # blocks violations pre-execution
-            )
-            def approve_loan(application: dict) -> dict: ...
+        Not part of the public API surface (use ``tl.register`` / ``tl.init``).
+
+        Validates kwargs eagerly (unknown keyword → ``TypeError``) so the
+        documented argument list stays truthful.
         """
-        def decorator(fn: Callable) -> Callable:
-            # ── Runtime enforcement: register policy + start local gate ──────
-            if enforce:
-                try:
-                    from .gate_local import get_shared_cache
-                    cache = get_shared_cache(self._client)
-                    if cache:
-                        cache.register(name or self.agent_name or fn.__name__, enforce)
-                except Exception:
-                    pass
+        return _UsingHandle(
+            self,
+            name,
+            dict(
+                enforce=enforce, compliance=compliance, risk_level=risk_level,
+                human_sponsor=human_sponsor, purpose=purpose,
+                authorized_actions=authorized_actions, max_cost_usd=max_cost_usd,
+                require_approval_when=require_approval_when,
+                approval_message=approval_message, approval_title=approval_title,
+                approval_timeout=approval_timeout,
+                approval_poll_interval=approval_poll_interval,
+                approval_via=approval_via, version=version,
+                kill_switch=kill_switch, drift_threshold=drift_threshold,
+            ),
+        )
 
-            @functools.wraps(fn)
-            def wrapper(*args, **kwargs):
-                agent_name    = name or self.agent_name or fn.__name__
-                agent_version = version or self.agent_version
-                human_sponsor = sponsor or self.human_sponsor
-                run_id = str(uuid.uuid4())
+    @contextmanager
+    def _using_cm(
+        self,
+        name: str,
+        *,
+        enforce: Optional[List[str]] = None,
+        compliance: Optional[List[str]] = None,
+        risk_level: str = "MEDIUM",
+        human_sponsor: Optional[str] = None,
+        purpose: Optional[str] = None,
+        authorized_actions: Optional[List[str]] = None,
+        max_cost_usd: Optional[float] = None,
+        require_approval_when: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        approval_message: Optional[str] = None,
+        approval_title: Optional[str] = None,
+        approval_timeout: int = 3600,
+        approval_poll_interval: int = 5,
+        approval_via: str = "forma",
+        version: Optional[str] = None,
+        kill_switch: bool = False,
+        drift_threshold: float = 0.15,
+    ) -> Generator[AgentRun, None, None]:
+        """Internal generator that powers :meth:`using`. Pushes/pops a discrete
+        governed run + scope using contextvars tokens so attribution is correct
+        under threads and asyncio."""
+        # Per-scope runtime enforcement (local gate).
+        # Only register the policy once — subsequent calls with the same agent
+        # name skip this to avoid redundant lock contention and thread spawns.
+        if enforce:
+            try:
+                from .gate_local import get_shared_cache
+                cache = get_shared_cache(self._client)
+                if cache and cache.get(name) is None:
+                    cache.register(name, list(enforce), authorized_actions=authorized_actions)
+            except Exception as _exc:
+                logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
 
-                # Compute chain IDs
-                effective_chain_id = chain_id or (str(uuid.uuid4()) if chain_parent else None)
-                depth = 0
-                if chain_parent and effective_chain_id:
-                    # Infer depth from parent (simple: just count)
-                    depth = 1  # caller should pass explicit chain_id for deeper chains
+        run = AgentRun(
+            run_id=str(uuid.uuid4()),
+            agent_name=name,
+            agent_version=version or self.agent_version,
+            human_sponsor=human_sponsor or self.human_sponsor,
+            started_at=datetime.now(timezone.utc),
+            input_data={"source": "tl.using"},
+            metadata={
+                "risk_level": risk_level,
+                "purpose": purpose,
+                "enforce": list(enforce) if enforce else [],
+                "compliance_frameworks": list(compliance) if compliance else [],
+            },
+        )
+        scope = {
+            "agent_name": name,
+            "require_approval_when": require_approval_when,
+            "approval": {
+                "message": approval_message,
+                "title": approval_title,
+                "timeout": approval_timeout,
+                "poll_interval": approval_poll_interval,
+                "via": approval_via,
+            },
+            "max_cost_usd": max_cost_usd,
+            "authorized_actions": authorized_actions,
+        }
+        # Per-agent kill switch: a dedicated poller per agent name, started once,
+        # whose event is checked on every captured call made inside this scope.
+        if kill_switch:
+            scope["kill_event"] = self._ensure_agent_kill_watch(name)
 
-                # Hash inputs for chain integrity
-                input_payload = {"args": [str(a) for a in args], "kwargs": {k: str(v) for k, v in kwargs.items()}}
-                input_hash = _hash_payload(input_payload) if effective_chain_id else None
+        run_token = _push_run(run)
+        scope_token = _push_scope(scope)
 
-                run = AgentRun(
-                    run_id=run_id,
-                    agent_name=agent_name,
-                    agent_version=agent_version,
-                    human_sponsor=human_sponsor,
-                    started_at=datetime.now(timezone.utc),
-                    input_data=input_payload,
-                    metadata={
-                        "chain_id": effective_chain_id,
-                        "parent_run_id": chain_parent,
-                        "chain_depth": depth,
-                        "input_hash": input_hash,
-                        "risk_level": risk_level,
-                        "purpose": purpose,
-                        "enforce": list(enforce) if enforce else [],
-                    },
-                )
-                _set_current_run(run)
+        # Passport registration is handled once at wrapper-setup time in
+        # _UsingHandle.__call__ — do NOT call it here or it fires on every
+        # function invocation (1000 calls/min → 1000 background threads/min).
 
-                # ── Kill switch poller ────────────────────────────────────────
-                poller: Optional[_KillPoller] = None
-                agent_id_for_kill: Optional[str] = None
-                if kill_switch:
-                    # We need the agent_id — look it up by name (best effort)
-                    # The poller will be started, and the agent_id resolved on first poll
-                    # For now we use agent_name as a proxy; server matches by name + org
-                    agent_id_for_kill = f"name:{agent_name}"  # server resolves by name
-                    poller = _KillPoller(
-                        agent_id=agent_id_for_kill,
-                        api_url=self.api_url,
-                        api_key=self.api_key,
-                    )
-                    poller.start()
-
-                try:
-                    result = fn(*args, **kwargs)
-                    if poller and poller.is_killed():
-                        raise KillSwitchTriggered(f"Agent '{agent_name}' received kill signal")
-                    run.status = RunStatus.SUCCESS
-                    run.output_data = result
-                    # Hash output for chain linking
-                    if effective_chain_id:
-                        run.metadata["output_hash"] = _hash_payload(result)
-                    return result
-                except KillSwitchTriggered:
-                    run.status = RunStatus.FAILED
-                    run.error = "Killed by operator via kill switch"
-                    raise
-                except Exception as exc:
-                    run.status = RunStatus.FAILED
-                    run.error = str(exc)
-                    raise
-                finally:
-                    if poller:
-                        poller.stop()
-                    run.ended_at = datetime.now(timezone.utc)
-                    run.duration_ms = int(
-                        (run.ended_at - run.started_at).total_seconds() * 1000
-                    )
-                    run.total_tokens = sum(
-                        (s.prompt_tokens or 0) + (s.completion_tokens or 0)
-                        for s in run.steps
-                    )
-                    run.total_cost_usd = sum(s.cost_usd or 0.0 for s in run.steps)
-
-                    if max_cost_usd is not None and run.total_cost_usd > max_cost_usd:
-                        run.status = RunStatus.FAILED
-                        run.error = f"Cost limit exceeded: ${run.total_cost_usd:.4f} > ${max_cost_usd}"
-
-                    run_dict = run.to_dict()
-                    # Embed chain metadata into the run dict for backend
-                    run_dict["metadata"] = run.metadata or {}
-                    run.signature = sign_run(run_dict, secret_key=self.api_key)
-                    _set_current_run(None)
-                    self._client.send_run(run)
-
-                    # Acknowledge kill if applicable
-                    if poller and poller.is_killed() and agent_id_for_kill:
-                        self._ack_kill_async(agent_id_for_kill, run_id)
-
-            # Register passport asynchronously on first decoration (at import time)
-            threading.Thread(
-                target=_register_passport_async,
-                args=(
-                    fn.__name__,
-                    purpose,
-                    authorized_actions or [],
-                    risk_level,
-                    self.human_sponsor,
-                    kill_switch,
-                    compliance or [],
-                    drift_threshold,
-                    self.api_url,
-                    self.api_key,
-                ),
-                daemon=True,
-            ).start()
-
-            return wrapper
-
-        if func is not None:
-            return decorator(func)
-        return decorator
+        try:
+            yield run
+        except Exception as exc:
+            run.status = RunStatus.FAILED
+            run.error = str(exc)
+            raise
+        finally:
+            _pop_scope(scope_token)
+            _pop_run(run_token)
+            self._finalize_and_send(run, max_cost_usd=max_cost_usd)
 
     def _ack_kill_async(self, agent_id: str, run_id: str):
         import urllib.request
@@ -485,8 +713,8 @@ class PROVNTracker:
                     method="POST",
                 )
                 urllib.request.urlopen(req, timeout=5)
-            except Exception:
-                pass
+            except Exception as _exc:
+                logging.getLogger(__name__).debug("suppressed exception: %s", _exc)
         threading.Thread(target=_ack, daemon=True).start()
 
     def _configure_ambient(
@@ -495,16 +723,32 @@ class PROVNTracker:
         compliance: Optional[List[str]],
         gate: bool,
         ambient_runs: bool,
+        *,
+        max_cost_usd: Optional[float] = None,
+        authorized_actions: Optional[List[str]] = None,
+        require_approval_when: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        approval_message: Optional[str] = None,
+        approval_title: Optional[str] = None,
+        approval_timeout: int = 3600,
+        approval_poll_interval: int = 5,
+        approval_via: str = "forma",
     ) -> None:
         """
         Write ambient run settings into auto._ambient_config so that every
-        auto-captured LLM call (without a decorator) creates a real AgentRun.
-        Also resets the cached PROVNClient so it picks up the new credentials.
+        auto-captured LLM call (with no scope/decorator) creates a real
+        AgentRun and is governed by the process-wide init() config. Also resets
+        the cached FormaClient so it picks up the new credentials.
         """
         import trustlayer.auto as _auto
         _auto._ambient_client = None  # reset cached client on config change
+        _auto._server_gate_cooldown_until = 0.0  # fresh init starts gate-healthy
         _auto._ambient_config.update({
             "enabled": ambient_runs,
+            # Clear any kill_event left over from a previous init() call.
+            # _start_global_kill_watch() (called after _configure_ambient) will
+            # set a fresh event when kill_switch=True — without this reset, a
+            # second tl.init(kill_switch=False) would leave the old event active.
+            "kill_event": None,
             "agent_name": agent_name or self.agent_name or _infer_app_name(),
             "agent_version": self.agent_version,
             "human_sponsor": self.human_sponsor,
@@ -512,6 +756,19 @@ class PROVNTracker:
             "gate_enabled": gate,
             "api_key": self.api_key,
             "api_url": self.api_url,
+            "timeout": self._timeout,
+            "max_retries": self._max_retries,
+            "fail_closed": self._fail_closed,
+            "max_cost_usd": max_cost_usd,
+            "authorized_actions": list(authorized_actions) if authorized_actions else None,
+            "require_approval_when": require_approval_when,
+            "approval": {
+                "message": approval_message,
+                "title": approval_title,
+                "timeout": approval_timeout,
+                "poll_interval": approval_poll_interval,
+                "via": approval_via,
+            },
         })
 
     def _start_global_kill_watch(self, agent_name: Optional[str] = None) -> None:
@@ -533,78 +790,47 @@ class PROVNTracker:
         _auto._ambient_config["kill_event"] = poller._kill_event
         self._global_kill_poller = poller  # keep reference so GC doesn't kill it
 
-    def track(
-        self,
-        func: Optional[Callable] = None,
-        *,
-        name: Optional[str] = None,
-        version: Optional[str] = None,
-        sponsor: Optional[str] = None,
-        max_cost_usd: Optional[float] = None,
-        risk_class: Optional[str] = None,
-    ):
+    def _ensure_agent_kill_watch(self, name: str) -> "threading.Event":
         """
-        Decorator. Usage:
-
-            tracker = PROVNTracker(agent_name="my-agent", human_sponsor="alice@co.com")
-
-            @tracker.track
-            def run_agent(query: str): ...
+        Start (once) a per-agent kill-switch poller for ``name`` and return its
+        kill event. The event is stored on the agent's scope so captured calls
+        inside ``tl.register(name, ..., kill_switch=True)`` are halted the moment
+        an operator triggers a kill for that agent.
         """
-        def decorator(fn: Callable) -> Callable:
-            @functools.wraps(fn)
-            def wrapper(*args, **kwargs):
-                agent_name = name or self.agent_name or fn.__name__
-                agent_version = version or self.agent_version
-                human_sponsor = sponsor or self.human_sponsor
-                run_id = str(uuid.uuid4())
-
-                run = AgentRun(
-                    run_id=run_id,
-                    agent_name=agent_name,
-                    agent_version=agent_version,
-                    human_sponsor=human_sponsor,
-                    started_at=datetime.now(timezone.utc),
-                    input_data={"args": args, "kwargs": kwargs},
+        # Get-or-create under the lock so concurrent first-calls don't each
+        # start a duplicate poller thread for the same agent.
+        with self._kill_lock:
+            poller = self._agent_kill_pollers.get(name)
+            if poller is None:
+                poller = _KillPoller(
+                    agent_id=f"name:{name}",
+                    api_url=self.api_url,
+                    api_key=self.api_key,
                 )
-                if risk_class:
-                    run.metadata = {"risk_class": risk_class}
-                _set_current_run(run)
+                poller.start()
+                self._agent_kill_pollers[name] = poller
+        return poller._kill_event
 
-                try:
-                    result = fn(*args, **kwargs)
-                    run.status = RunStatus.SUCCESS
-                    run.output_data = result
-                    return result
-                except Exception as exc:
-                    run.status = RunStatus.FAILED
-                    run.error = str(exc)
-                    raise
-                finally:
-                    run.ended_at = datetime.now(timezone.utc)
-                    run.duration_ms = int(
-                        (run.ended_at - run.started_at).total_seconds() * 1000
-                    )
-                    run.total_tokens = sum(
-                        (s.prompt_tokens or 0) + (s.completion_tokens or 0)
-                        for s in run.steps
-                    )
-                    run.total_cost_usd = sum(s.cost_usd or 0.0 for s in run.steps)
+    def shutdown(self) -> None:
+        """
+        Stop this tracker's background kill-switch pollers.
 
-                    if max_cost_usd is not None and run.total_cost_usd > max_cost_usd:
-                        run.status = RunStatus.FAILED
-                        run.error = f"Cost limit exceeded: ${run.total_cost_usd:.4f} > ${max_cost_usd}"
-
-                    run_dict = run.to_dict()
-                    run.signature = sign_run(run_dict, secret_key=self.api_key)
-                    _set_current_run(None)
-                    self._client.send_run(run)
-
-            return wrapper
-
-        if func is not None:
-            return decorator(func)
-        return decorator
+        Called on re-init (a second tl.init()) so the previous tracker's poller
+        threads don't keep polling the API forever — otherwise every re-init in a
+        notebook / dev hot-reload / worker re-import leaks a thread that hits
+        /kill-status every 2s. Best-effort: never raises.
+        """
+        with self._kill_lock:
+            pollers = list(self._agent_kill_pollers.values())
+            self._agent_kill_pollers.clear()
+        if self._global_kill_poller is not None:
+            pollers.append(self._global_kill_poller)
+            self._global_kill_poller = None
+        for p in pollers:
+            try:
+                p.stop()
+            except Exception as _exc:
+                logging.getLogger(__name__).debug("poller stop failed: %s", _exc)
 
     @contextmanager
     def llm_call(
@@ -634,9 +860,19 @@ class PROVNTracker:
                 agent_id, action_type="llm_call", prompt=prompt,
             )
             if gate_result.get("decision") == "block":
+                from .errors import fmt_compliance_violation
+                _reason = gate_result.get("reason","Compliance gate blocked this LLM call.")
+                _pii = _reason.split("PII detected: ")
+                _pii_type = _pii[1].split(".")[0] if len(_pii) > 1 else None
                 raise ComplianceViolation(
-                    reason=gate_result.get("reason", "Compliance gate blocked this LLM call."),
-                    rule_id=gate_result.get("rule_id"),
+                    fmt_compliance_violation(
+                        reason=_reason,
+                        rule_id=gate_result.get("rule_id"),
+                        pii_type=_pii_type,
+                        agent_name=getattr(run,"agent_name",None) if run else None,
+                        prompt_snippet=prompt[:120] if prompt else None,
+                        enforce_packs=[],
+                    )
                 )
 
         step_number = len(run.steps) + 1 if run else 1
@@ -719,78 +955,137 @@ class PROVNTracker:
 
 # ── Module-level default tracker ─────────────────────────────────────────────
 
-_default_tracker: Optional[PROVNTracker] = None
+_default_tracker: Optional[FormaTracker] = None
 
 
-def _get_default_tracker() -> PROVNTracker:
+def _get_default_tracker() -> FormaTracker:
     global _default_tracker
     if _default_tracker is None:
-        _default_tracker = PROVNTracker()
+        _default_tracker = FormaTracker()
     return _default_tracker
 
 
-def track(
-    func: Optional[Callable] = None,
+def using(
+    name: str,
     *,
-    name: Optional[str] = None,
-    version: str = "1.0.0",
-    sponsor: Optional[str] = None,
-):
-    """
-    Module-level @track decorator using environment variable configuration.
-
-    Configure via env vars:
-        TRUSTLAYER_API_KEY
-        TRUSTLAYER_API_URL
-        TRUSTLAYER_HUMAN_SPONSOR
-
-    Usage:
-        @track
-        def my_agent(query: str): ...
-    """
-    return _get_default_tracker().track(func, name=name, version=version, sponsor=sponsor)
-
-
-def agent(
-    func: Optional[Callable] = None,
-    *,
-    name: Optional[str] = None,
-    version: str = "1.0.0",
-    sponsor: Optional[str] = None,
-    purpose: str = "General AI agent task",
-    authorized_actions: Optional[List[str]] = None,
-    risk_level: str = "MEDIUM",
-    kill_switch: bool = False,
-    chain_parent: Optional[str] = None,
-    chain_id: Optional[str] = None,
-    drift_threshold: float = 0.15,
-    compliance: Optional[List[str]] = None,
-    max_cost_usd: Optional[float] = None,
     enforce: Optional[List[str]] = None,
+    compliance: Optional[List[str]] = None,
+    risk_level: str = "MEDIUM",
+    human_sponsor: Optional[str] = None,
+    purpose: Optional[str] = None,
+    authorized_actions: Optional[List[str]] = None,
+    max_cost_usd: Optional[float] = None,
+    require_approval_when: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    approval_message: Optional[str] = None,
+    approval_title: Optional[str] = None,
+    approval_timeout: int = 3600,
+    approval_poll_interval: int = 5,
+    approval_via: str = "forma",
+    version: Optional[str] = None,
+    kill_switch: bool = False,
+    drift_threshold: float = 0.15,
 ):
     """
-    Module-level @agent decorator — full governance stack with runtime
-    enforcement.
+    Internal multi-agent scope helper that powers ``tl.register()`` and
+    ``tl.init(agents={...})``. Not part of the public API surface — call
+    ``tl.register(name, fn, ...)`` (or pass ``agents={...}`` to ``tl.init``)
+    instead.
 
-        @tl.agent(
-            name="loan-approval",
-            purpose="Loan application evaluation",
-            risk_level="HIGH",
-            kill_switch=True,
-            enforce=["rbi_ml_risk", "dpdp"],   # block violations pre-execution
-        )
-        def approve_loan(application: dict) -> dict: ...
-
-    With enforce=[...], every LLM/tool call is checked against the framework
-    policy packs locally (<1ms) BEFORE it executes. Violations raise
-    ComplianceViolation and appear as blocked events in the audit trail.
+    Every auto-captured LLM/tool call inside the scope is attributed to ``name``
+    as its own discrete, signed run, with its own enforcement, approval, and
+    governance config. Scopes may be nested.
     """
-    return _get_default_tracker().agent(
-        func,
-        name=name, version=version, sponsor=sponsor,
-        purpose=purpose, authorized_actions=authorized_actions,
-        risk_level=risk_level, kill_switch=kill_switch,
-        chain_parent=chain_parent, chain_id=chain_id,
-        drift_threshold=drift_threshold, compliance=compliance,
-        max_cost_usd=max_cost_usd, enforce=enforce,
+    return _get_default_tracker().using(
+        name,
+        enforce=enforce, compliance=compliance, risk_level=risk_level,
+        human_sponsor=human_sponsor, purpose=purpose,
+        authorized_actions=authorized_actions, max_cost_usd=max_cost_usd,
+        require_approval_when=require_approval_when,
+        approval_message=approval_message, approval_title=approval_title,
+        approval_timeout=approval_timeout, approval_poll_interval=approval_poll_interval,
+        approval_via=approval_via, version=version,
+        kill_switch=kill_switch, drift_threshold=drift_threshold,
     )
+
+
+def register(name: str, fn: Optional[Callable] = None, **cfg):
+    """Bind an existing function to a FORMA agent — one of the SDK's two entry
+    points (the other is :func:`init`).
+
+    Governs an *existing* function **without touching its body** and without a
+    decorator line. Every auto-captured LLM/tool call made while the function
+    runs is attributed to ``name`` with its own discrete, signed run and its own
+    enforce / approval / governance config.
+
+        import trustlayer as tl
+        from my_app import loan_screener, fraud_detector
+
+        tl.init(api_key="tl_live_...")
+        tl.register("loan-screener", loan_screener,
+                    enforce=["rbi_ml_risk", "dpdp"], risk_level="HIGH",
+                    kill_switch=True, max_cost_usd=5.0)
+        tl.register("fraud-detector", fraud_detector, enforce=["dpdp"])
+
+    ``register`` re-points the name in the function's defining module to the
+    governed wrapper, so existing callers transparently get governance. It also
+    works as a decorator::
+
+        @tl.register("loan-screener", enforce=["rbi_ml_risk"])
+        def loan_screener(application): ...
+
+    When to use ``tl.register`` vs ``tl.init(agents={...})``:
+      * ``tl.init(agents={...})`` — bulk-register when every agent function is
+        importable at the single init() call (top of your entrypoint). Simplest.
+      * ``tl.register(name, fn, ...)`` — when a function is imported/defined
+        AFTER init(), when you want the decorator form ``@tl.register(...)``, or
+        for conditional / dynamic registration.
+
+    Accepts the **same full keyword set as** :func:`init`'s per-agent governance
+    config: ``enforce, compliance, risk_level, human_sponsor, purpose,
+    authorized_actions, max_cost_usd, require_approval_when, approval_message,
+    approval_title, approval_timeout, approval_poll_interval, approval_via,
+    version, kill_switch, drift_threshold`` (unknown keyword → ``TypeError``).
+    Works for sync and ``async def`` targets.
+
+    Caveat: like ``tl.init``, this must run before the target is *called*
+    (top of your entrypoint). A pre-existing ``from mod import fn`` alias that
+    was bound before ``register`` ran won't be intercepted — import the module
+    and reference ``mod.fn`` so the re-point is visible to callers.
+    """
+
+    if not isinstance(name, str):
+        raise TypeError(
+            f"tl.register() first argument must be a string agent name, "
+            f"got {type(name).__name__}. "
+            f"Usage: tl.register('agent-name', fn, **cfg)"
+        )
+
+    # Validate all governance params eagerly — bad values should be caught at
+    # registration time, not silently stored and crash at call time.
+    try:
+        from trustlayer import _validate_packs, _validate_governance_params
+        _validate_packs(cfg.get("enforce"), cfg.get("compliance"),
+                        caller=f"tl.register('{name}')")
+        _validate_governance_params(
+            cfg.get("risk_level", "MEDIUM"),
+            cfg.get("require_approval_when"),
+            cfg.get("approval_timeout", 3600),
+            cfg.get("approval_poll_interval", 5),
+            cfg.get("drift_threshold", 0.15),
+            caller=f"tl.register('{name}')",
+        )
+    except ImportError:
+        pass  # circular-import guard during package initialisation
+
+    def _wrap(f: Callable) -> Callable:
+        # using() validates kwargs (raises TypeError on unknown keys) and returns
+        # an async-aware handle; calling it on f produces the governed wrapper.
+        wrapped = using(name, **cfg)(f)
+        fn_module = getattr(f, "__module__", None) or ""
+        if fn_module != "builtins":
+            mod = sys.modules.get(fn_module)
+            if mod is not None and getattr(mod, getattr(f, "__name__", ""), None) is f:
+                setattr(mod, f.__name__, wrapped)  # re-point name → governed wrapper
+        return wrapped
+
+    return _wrap(fn) if fn is not None else _wrap
