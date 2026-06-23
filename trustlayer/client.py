@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("trustlayer")
 
-_UA = "FORMA-SDK/2.3.16"
+_UA = "FORMAAI-SDK/2.3.20"
 _RETRYABLE_STATUS = lambda s: s == 429 or 500 <= s < 600  # noqa: E731
 
 
@@ -60,7 +60,7 @@ class FormaClient:
     def __init__(
         self,
         api_key: str,
-        base_url: str = "https://provn-6f5i.onrender.com",
+        base_url: str = "https://api.formaai.in",
         *,
         timeout: int = 10,
         max_retries: int = 2,

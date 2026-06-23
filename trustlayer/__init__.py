@@ -9,7 +9,7 @@ from .errors import (
     FormaError, FormaConnectionError, FormaAuthError, FormaRateLimitError, FormaAPIError,
 )
 
-__version__ = "2.3.16"
+__version__ = "2.3.20"
 
 # Shared constants — used by both init() and the validate helpers below
 _VALID_PACKS = frozenset({"ai_safety", "dpdp", "rbi_ml_risk", "eu_ai_act", "iso42001", "soc2", "hipaa", "nist", "gdpr", "pci_dss"})
@@ -39,7 +39,7 @@ def _resolve_preset(preset, enforce, compliance):
     spec = _PRESETS.get(str(name).strip().lower())
     if not spec:
         raise ValueError(
-            f"[FORMA] tl.init: Unknown preset={name!r}. Valid presets: {sorted(_PRESETS)}"
+            f"[FORMAAI] tl.init: Unknown preset={name!r}. Valid presets: {sorted(_PRESETS)}"
         )
     if not enforce:
         enforce = list(spec["enforce"])
@@ -64,7 +64,7 @@ def _validate_packs(enforce, compliance, *, caller: str = "tl.init") -> None:
         invalid = [f for f in compliance if f not in _VALID_FRAMEWORKS]
         if invalid:
             raise ValueError(
-                f"\n\033[31m  [FORMA] {caller}: Unknown compliance framework(s): {invalid}\033[0m\n\n"
+                f"\n\033[31m  [FORMAAI] {caller}: Unknown compliance framework(s): {invalid}\033[0m\n\n"
                 f"  ┌─ Fix ─────────────────────────────────────────────────────┐\n"
                 f"  │  Valid frameworks (UPPERCASE):                            │\n"
                 f"  │    'DPDP'     'RBI_MRM'   'EU_AI_ACT'   'ISO_42001'      │\n"
@@ -95,8 +95,8 @@ def _validate_governance_params(
         from .errors import fmt_invalid_risk_level
         raise ValueError(fmt_invalid_risk_level(risk_level, caller))
     if require_approval_when is not None and not callable(require_approval_when):
-        raise ValueError(
-            f"\n\033[31m  [FORMA] {caller}: require_approval_when must be a callable.\033[0m\n"
+        raise TypeError(
+            f"\n\033[31m  [FORMAAI] {caller}: require_approval_when must be a callable.\033[0m\n"
             f"  Got: {type(require_approval_when).__name__} (not callable)\n\n"
             f"  ┌─ Fix ─────────────────────────────────────────────────────┐\n"
             f"  │  Pass a function that returns True when approval needed:  │\n"
@@ -110,7 +110,7 @@ def _validate_governance_params(
         )
     if approval_timeout <= 0:
         raise ValueError(
-            f"\n\033[31m  [FORMA] {caller}: approval_timeout must be > 0 (got {approval_timeout})\033[0m\n"
+            f"\n\033[31m  [FORMAAI] {caller}: approval_timeout must be > 0 (got {approval_timeout})\033[0m\n"
             f"  ┌─ Fix ─────────────────────────────────────────────────────┐\n"
             f"  │  tl.init(approval_timeout=3600)   # 1 hour (default)     │\n"
             f"  │  tl.init(approval_timeout=7200)   # 2 hours              │\n"
@@ -118,12 +118,12 @@ def _validate_governance_params(
         )
     if approval_poll_interval <= 0:
         raise ValueError(
-            f"\n\033[31m  [FORMA] {caller}: approval_poll_interval must be > 0 (got {approval_poll_interval})\033[0m\n"
+            f"\n\033[31m  [FORMAAI] {caller}: approval_poll_interval must be > 0 (got {approval_poll_interval})\033[0m\n"
             f"  Fix: tl.init(approval_poll_interval=5)   # poll every 5s (default)\n"
         )
     if not (0.0 < drift_threshold <= 1.0):
         raise ValueError(
-            f"\n\033[31m  [FORMA] {caller}: drift_threshold must be in (0.0, 1.0] (got {drift_threshold})\033[0m\n"
+            f"\n\033[31m  [FORMAAI] {caller}: drift_threshold must be in (0.0, 1.0] (got {drift_threshold})\033[0m\n"
             f"  ┌─ Fix ─────────────────────────────────────────────────────┐\n"
             f"  │  tl.init(drift_threshold=0.15)   # 15% drift → warn      │\n"
             f"  │  tl.init(drift_threshold=0.30)   # 30% drift → warn      │\n"

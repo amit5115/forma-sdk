@@ -2,11 +2,11 @@ from setuptools import setup, find_packages
 
 setup(
     name="forma-sdk",
-    version="2.3.16",
+    version="2.3.20",
     description="FORMA — AI agent compliance SDK. Zero-config tracking, EU AI Act/DPDP/RBI compliance, cryptographic audit trails.",
     long_description=open("README.md").read() if __import__("os").path.exists("README.md") else "",
     long_description_content_type="text/markdown",
-    author="FORMA",
+    author="FORMAAI",
     author_email="sdk@formaai.in",
     url="https://github.com/amit5115/forma-sdk",
     packages=find_packages(include=["trustlayer*"]),

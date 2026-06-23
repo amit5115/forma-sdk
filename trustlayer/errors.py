@@ -1,5 +1,5 @@
 """
-Typed error hierarchy for the FORMA SDK.
+Typed error hierarchy for the FORMAAI SDK.
 
 The HTTP transport (client.py) parses the API's standardized error body
 (`{"error": {"code", "message", ...}}`) and raises the matching subclass, so
@@ -25,7 +25,7 @@ from typing import Optional
 
 
 class FormaError(Exception):
-    """Base class for all FORMA SDK errors."""
+    """Base class for all FORMAAI SDK errors."""
 
     def __init__(self, message: str, *, code: Optional[str] = None, status: Optional[int] = None):
         super().__init__(message)
@@ -133,7 +133,7 @@ def fmt_compliance_violation(reason: str, rule_id: Optional[str], pii_type: Opti
     snip = f"\n  │  Prompt: \"{prompt_snippet[:70]}{'...' if prompt_snippet and len(prompt_snippet)>70 else ''}\"" if prompt_snippet else ""
     packs = f"\n  │  Active packs: {', '.join(enforce_packs)}" if enforce_packs else ""
     return (
-        f"\n\033[31m  [FORMA Gate] BLOCKED — {rule_label}\033[0m\n"
+        f"\n\033[31m  [FORMAAI Gate] BLOCKED — {rule_label}\033[0m\n"
         f"  Agent: {agent}  |  Rule: {rule_id or 'gate'}{snip}{packs}\n\n"
         f"  ┌─ What happened ───────────────────────────────────────────┐\n"
         f"  │  {reason[:72]}\n"
@@ -147,7 +147,7 @@ def fmt_compliance_violation(reason: str, rule_id: Optional[str], pii_type: Opti
 
 def fmt_no_key() -> str:
     return (
-        "\n\033[33m  [FORMA] No API key — running without enforcement.\033[0m\n\n"
+        "\n\033[33m  [FORMAAI] No API key — running without enforcement.\033[0m\n\n"
         "  ┌─ Fix (pick one) ──────────────────────────────────────────┐\n"
         "  │  A) Pass directly:  tl.init(api_key='tl_live_...')        │\n"
         "  │  B) Env var:        export FORMA_API_KEY='tl_live_...'    │\n"
@@ -169,7 +169,7 @@ def fmt_invalid_packs(invalid: list, valid_packs: list, caller: str) -> str:
         f"✗ '{p}' → did you mean '{closest(p)}'?" if closest(p) else f"✗ '{p}' (not a valid pack)"
         for p in invalid)
     return (
-        f"\n\033[31m  [FORMA] {caller}: Unknown pack(s): {invalid}\033[0m\n\n"
+        f"\n\033[31m  [FORMAAI] {caller}: Unknown pack(s): {invalid}\033[0m\n\n"
         f"  ┌─ Fix ─────────────────────────────────────────────────────┐\n"
         f"  │  {typo_hints}\n"
         f"  │                                                            │\n"
@@ -183,7 +183,7 @@ def fmt_invalid_packs(invalid: list, valid_packs: list, caller: str) -> str:
 
 def fmt_invalid_risk_level(value: str, caller: str) -> str:
     return (
-        f"\n\033[31m  [FORMA] {caller}: Invalid risk_level='{value}'\033[0m\n\n"
+        f"\n\033[31m  [FORMAAI] {caller}: Invalid risk_level='{value}'\033[0m\n\n"
         f"  ┌─ Fix ─────────────────────────────────────────────────────┐\n"
         f"  │  Valid values (uppercase):                                 │\n"
         f"  │    'LOW'       internal tools, analytics                  │\n"
@@ -198,7 +198,7 @@ def fmt_invalid_risk_level(value: str, caller: str) -> str:
 
 def fmt_kill_switch(agent_name: str, reason: Optional[str] = None) -> str:
     return (
-        f"\n\033[31m  [FORMA] Kill switch ACTIVE — '{agent_name}' is frozen.\033[0m\n"
+        f"\n\033[31m  [FORMAAI] Kill switch ACTIVE — '{agent_name}' is frozen.\033[0m\n"
         f"  {('Reason: ' + reason) if reason else ''}\n\n"
         f"  ┌─ How to resume ───────────────────────────────────────────┐\n"
         f"  │  Dashboard → Agents → '{agent_name}' → Kill Switch → Clear │\n"
@@ -209,7 +209,7 @@ def fmt_kill_switch(agent_name: str, reason: Optional[str] = None) -> str:
 
 def fmt_approval_rejected(agent_name: str, reason: Optional[str] = None) -> str:
     return (
-        f"\n\033[33m  [FORMA] Approval REJECTED for '{agent_name}'.\033[0m\n"
+        f"\n\033[33m  [FORMAAI] Approval REJECTED for '{agent_name}'.\033[0m\n"
         f"  {('Reason: ' + reason) if reason else 'No reason given.'}\n\n"
         f"  ┌─ What to do ──────────────────────────────────────────────┐\n"
         f"  │  The action was NOT executed. Log this and inform the     │\n"
@@ -220,7 +220,7 @@ def fmt_approval_rejected(agent_name: str, reason: Optional[str] = None) -> str:
 
 def fmt_approval_timeout(agent_name: str, timeout_s: int) -> str:
     return (
-        f"\n\033[33m  [FORMA] Approval timeout for '{agent_name}' after {timeout_s}s.\033[0m\n\n"
+        f"\n\033[33m  [FORMAAI] Approval timeout for '{agent_name}' after {timeout_s}s.\033[0m\n\n"
         f"  ┌─ Fix ─────────────────────────────────────────────────────┐\n"
         f"  │  Increase timeout: tl.init(approval_timeout=7200)  # 2h  │\n"
         f"  │  Or catch and handle: except ApprovalTimeoutError         │\n"

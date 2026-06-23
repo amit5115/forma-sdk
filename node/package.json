@@ -1,0 +1,39 @@
+{
+  "name": "forma-sdk",
+  "version": "1.2.0",
+  "description": "FORMA — The AI Agent Firewall for Node.js. Blocks Aadhaar/PAN/PII leaks, jailbreaks, and unauthorized actions before they execute. DPDP & RBI enforcement built in.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "governance",
+    "compliance",
+    "observability",
+    "eu-ai-act",
+    "dpdp",
+    "llm"
+  ],
+  "author": "FORMAAI <sdk@formaai.in>",
+  "license": "MIT",
+  "homepage": "https://formaai.in",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/forma-ai/forma-sdk-node"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}

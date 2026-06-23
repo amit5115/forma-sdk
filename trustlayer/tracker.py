@@ -443,6 +443,7 @@ class FormaTracker:
         _cfg = _forma_config()
         resolved_key = (
             api_key
+            or os.environ.get("FORMAAI_API_KEY")
             or os.environ.get("FORMA_API_KEY")
             or os.environ.get("TRUSTLAYER_API_KEY")
             or _cfg.get("api_key")
@@ -454,10 +455,11 @@ class FormaTracker:
         self.api_key = resolved_key or "dev"
         self.api_url = (
             api_url
+            or os.environ.get("FORMAAI_API_URL")
             or os.environ.get("FORMA_API_URL")
             or os.environ.get("TRUSTLAYER_API_URL")
             or _cfg.get("api_url")
-            or "https://provn-6f5i.onrender.com"
+            or "https://api.formaai.in"
         )
         self.agent_name = agent_name
         self.agent_version = agent_version

@@ -245,7 +245,7 @@ def _api_get(path: str, api_url: str, api_key: str) -> dict:
 
 def _get_api_config():
     return (
-        os.environ.get("FORMA_API_URL") or os.environ.get("TRUSTLAYER_API_URL") or "https://provn-6f5i.onrender.com",
+        os.environ.get("FORMA_API_URL") or os.environ.get("TRUSTLAYER_API_URL") or "https://api.formaai.in",
         os.environ.get("FORMA_API_KEY") or os.environ.get("TRUSTLAYER_API_KEY", "dev"),
     )
 
@@ -281,7 +281,7 @@ if HAS_CLICK:
         if not api_key:
             print(f"  {FAIL} {_red('A key is required — sign up free at https://formaai.in/signup')}")
             sys.exit(1)
-        api_url = os.environ.get("FORMA_API_URL") or "https://provn-6f5i.onrender.com"
+        api_url = os.environ.get("FORMA_API_URL") or "https://api.formaai.in"
 
         # 2) verify (best effort — never blocks setup)
         try:

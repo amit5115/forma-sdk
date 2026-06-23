@@ -51,14 +51,12 @@ _SIGNED_FIELDS = ("action_type", "decision", "rule_id", "reason", "tool_name", "
 # Keep this list in sync with the server's gate.py.
 _PII_PATTERNS: List[tuple] = [
     # Core India PII
-    # Covers: space/comma/dot/slash-separated Aadhaar. Deliberately excludes dash
-    # (4111-2023-0001 is structurally identical to 2341-1234-1236 — can't distinguish).
-    # Real Aadhaar attack vectors use spaces, commas, dots; dash is ambiguous.
+    # Covers: space/comma/dot/slash/dash-separated Aadhaar (4-4-4 pattern).
     ("Aadhaar number",    re.compile(
         r"\b(?:"
-        r"\d{4}[\s,./]?\d{4}[\s,./]?\d{4}"   # 4-4-4 with space/comma/dot/slash
+        r"\d{4}[\s,./\-]?\d{4}[\s,./\-]?\d{4}"   # 4-4-4 with space/comma/dot/slash/dash
         r"|"
-        r"\d(?:[\s,.]\d){11}"                  # every-digit-spaced: 2 3 4 1 1 2 3 4 1 2 3 6
+        r"\d(?:[\s,.]\d){11}"                       # every-digit-spaced: 2 3 4 1 1 2 3 4 1 2 3 6
         r")\b"
     )),
     ("Indian PAN",        re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")),

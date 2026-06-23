@@ -55,7 +55,7 @@ _ambient_config: dict = {
     "gate_enabled": False,      # pre-call compliance gate check
     "kill_event": None,         # threading.Event set by global kill poller
     "api_key": "dev",
-    "api_url": "https://provn-6f5i.onrender.com",
+    "api_url": "https://api.formaai.in",
     "timeout": 10,              # transport: init(timeout=)
     "max_retries": 2,           # transport: init(max_retries=)
     "fail_closed": False,       # gate fail-closed: init(fail_closed=)
@@ -139,8 +139,8 @@ def _flush_shadow_events():
             if not events:
                 continue
             try:
-                api_url = (os.environ.get("FORMA_API_URL") or os.environ.get("TRUSTLAYER_API_URL") or "https://provn-6f5i.onrender.com").rstrip("/")
-                api_key = os.environ.get("FORMA_API_KEY") or os.environ.get("TRUSTLAYER_API_KEY", "dev")
+                api_url = (os.environ.get("FORMAAI_API_URL") or os.environ.get("FORMA_API_URL") or os.environ.get("TRUSTLAYER_API_URL") or "https://api.formaai.in").rstrip("/")
+                api_key = os.environ.get("FORMAAI_API_KEY") or os.environ.get("FORMA_API_KEY") or os.environ.get("TRUSTLAYER_API_KEY", "dev")
                 payload = json.dumps({"events": events}).encode()
                 req = urllib.request.Request(
                     url=f"{api_url}/api/shadow/events", data=payload,
